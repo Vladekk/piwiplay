@@ -12,9 +12,28 @@ Extends [`SPEC.md`](SPEC.md) (v1: native-DSD-only). v2 makes piwiplay a
 - **DFF with DST decompression** (v1 plays raw DFF; DST needs a decoder).
 - **Formalized TUI integration tests** (already prototyped in v1).
 
-- **Status:** Draft
+- **Status:** Partially implemented (see below).
 - **Builds on:** the v1 engine/UI split, the `Command`/`Event` API, and the
   `OutputMode { Unknown, Native, Dop, Transcoded }` enum (already present in v1).
+
+### Implementation status
+
+**Done:**
+- All-formats decoding via the **ffmpeg CLI** (subprocess → `f32le`), not libav
+  linking — robust across ffmpeg versions (`crates/engine/src/pcm.rs`).
+- PCM output path in the sink (F32LE) alongside native DSD; software volume.
+- Per-track routing + the **`t` transcode toggle** (native DSD ⇄ PCM) with
+  active volume on the PCM path; live `NATIVE`/`PCM` badge.
+- DST-compressed DFF plays via the ffmpeg PCM fallback (our native decoder
+  rejects DST, the player then routes through ffmpeg).
+
+**Remaining (still design-only in this spec):**
+- **DoP** packing (`dop_pack`) and a DoP DAC path — the `Dop` badge is defined
+  but no code path emits it yet.
+- **Honest native detection** (§7) — currently reports `NATIVE` whenever a DSD
+  format negotiates; graph/link inspection is not yet implemented.
+- DSD→PCM transcode currently relies on ffmpeg's decimation rather than a
+  custom multi-stage low-pass.
 
 ---
 

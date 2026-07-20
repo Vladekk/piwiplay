@@ -5,9 +5,15 @@ A console (TUI) audio player for Linux that plays **DSD** files natively through
 
 - Native DSD (DSD64/128/256/512) via `.dsf` and `.dff`/`.dsdiff`
 - Bit-perfect passthrough to a DSD-capable PipeWire sink — no resampling
-- File/folder browser, simple playlists (M3U), transport, seek, volume
+- **All other formats via ffmpeg** (FLAC, ALAC, WAV, MP3, AAC, Opus, …),
+  decoded to PCM — plus a per-track toggle to transcode DSD to PCM so software
+  volume applies (press `t`)
+- Live **output-mode badge**: `NATIVE` (bit-perfect DSD) / `PCM` (decoded)
+- File/folder browser with **multi-select**, mouse support, simple playlists
+  (M3U), a saved-playlists pane, transport, seek, volume
 - Braille waveform, eighth-block sub-cell seek/volume bars, level meters
-- Resizable layout, truecolor/256/16-color with `NO_COLOR` support
+- Resizable layout; **terminal-themeable palette** (your terminal's colors, e.g.
+  Konsole "Vapor") or custom hex; `NO_COLOR` support
 - Installs into your user profile — no root, no system files
 
 See [`SPEC.md`](SPEC.md) for the v1 design and [`SPEC-v2.md`](SPEC-v2.md) for the
@@ -20,9 +26,11 @@ Milestone 0 proof that native DSD works through `pipewire-rs`
 **Runtime**
 - A running PipeWire session (≥ 0.3.60; developed against 1.6).
 - `libpipewire-0.3` shared library.
-- A DAC that accepts **native DSD** for sound. v1 has no DoP fallback (that is
-  v2); on a sink whose active profile exposes no DSD format, playback fails with
-  a clear message rather than converting.
+- A DAC that accepts **native DSD** for bit-perfect DSD playback. If the sink's
+  active profile exposes no DSD format, native playback errors — press `t` to
+  transcode that track to PCM instead.
+- **`ffmpeg`** (and `ffprobe`) on `PATH` for non-DSD formats and for the DSD→PCM
+  transcode toggle. DSD-only playback works without it.
 
 **Build**
 - A Rust toolchain (see `rust-version` in `Cargo.toml`).
@@ -89,24 +97,31 @@ piwiplay track.dsf       # queue and play a file
 
 | Key | Action | Key | Action |
 |---|---|---|---|
-| `space` | play / pause | `Tab` | switch Browser ⇄ Playlist |
-| `⏎` | open dir / play file / load .m3u | `↑↓` `k`/`j` | move selection |
-| `S` | stop | `g` / `G` | top / bottom |
-| `n` / `p` | next / previous | `←→` `h`/`l` | seek ∓5s |
-| `a` | add selection to playlist | `Shift+←→` | seek ∓30s |
-| `d` | remove from playlist | `[` `]` `-` `+` | volume |
-| `x` | save playlist | `m` | mute |
-| `/` | find in current pane | `r` | repeat cycle |
-| `?` | help | `z` | shuffle |
-| `q` / `Esc` / `Ctrl-C` | quit | | |
+| `space` | play / pause | `Tab` | cycle Browser → Playlist → Saved |
+| `⏎` | open / play / add marked / load .m3u | `Shift+Tab` | cycle panes backward |
+| `S` | stop | `↑↓` `k`/`j` | move selection |
+| `n` / `p` | next / previous | `Shift+↑↓` | multi-select (mark a range) |
+| `t` | toggle native DSD ⇄ transcode (PCM) | `PgUp` / `PgDn` | first / last item |
+| `a` | add selection to playlist | `←→` `h`/`l` | seek ∓5s |
+| `d` | remove from playlist | `Shift+←→` | seek ∓30s |
+| `x` | save playlist (default name) | `[` `]` `-` `+` | volume |
+| `X` | save playlist as… (prompt) | `m` | mute |
+| `L` | jump to system music library | `r` / `z` | repeat / shuffle |
+| `/` | find in current pane | `?` | help |
+| `q` / `Esc` / `Ctrl-C` | quit | mouse | click=select, dbl-click=play, wheel=scroll, click seek bar |
 
-### A note on volume
+### Output modes
 
-DSD is a 1-bit stream; attenuating it in software would mean decoding to PCM and
-would break bit-perfect playback. In v1 piwiplay therefore does **not** apply
-software volume to DSD — the on-screen volume reflects intent but the bits stay
-untouched (use your DAC's volume). This is deliberate (SPEC §5.4); a
-configurable PCM-volume path arrives in v2.
+The status bar shows how the current track reaches the DAC:
+
+- **`NATIVE`** — bit-perfect 1-bit DSD passthrough. Volume is **fixed** (the
+  bar shows `·fix`); use your DAC. Attenuating DSD in software would require
+  decoding to PCM and break bit-perfect playback (SPEC §5.4).
+- **`PCM`** — decoded to PCM via ffmpeg (any non-DSD file, or a DSD track after
+  pressing `t`). Here the on-screen **volume is active**.
+
+Press `t` to switch a DSD track between native and PCM when you want a working
+software volume.
 
 ## Architecture
 

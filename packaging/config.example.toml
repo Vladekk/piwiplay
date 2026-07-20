@@ -11,6 +11,10 @@ buffer_ms = 400
 
 [ui]
 theme = "dark"        # "dark" | "light"
+# "terminal" = use the terminal's own 16-color palette (themeable by the
+# terminal, e.g. Konsole "Vapor"); "custom" = use the [theme] hex colors below.
+palette = "terminal"
+mouse = true          # click to select/seek, double-click to play, wheel scrolls
 fps = 30              # render tick while playing
 waveform = "braille"  # "braille" | "blocks" | "off"
 min_cols = 60         # below this, show the "terminal too small" notice
