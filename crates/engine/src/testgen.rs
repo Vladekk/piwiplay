@@ -12,7 +12,7 @@ pub fn plane_byte(ch: usize, i: usize) -> u8 {
 /// blocks (last block zero-padded). Bytes come from [`plane_byte`].
 pub fn dsf_bytes(channels: usize, dsd_rate: u32, per_chan: usize, block_size: usize) -> Vec<u8> {
     let n_blocks = per_chan.div_ceil(block_size).max(1);
-    let padded = n_blocks * block_size;
+    let _padded = n_blocks * block_size;
 
     let mut data = Vec::new();
     for b in 0..n_blocks {

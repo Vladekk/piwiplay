@@ -289,7 +289,7 @@ mod tests {
     fn m3u_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pl.m3u");
-        let mut p = list(2);
+        let p = list(2);
         p.save_m3u(&path).unwrap();
         let paths = Playlist::load_m3u_paths(&path).unwrap();
         assert_eq!(paths.len(), 2);

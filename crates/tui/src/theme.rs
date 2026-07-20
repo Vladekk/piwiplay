@@ -14,6 +14,9 @@ pub struct Theme {
     pub meter_clip: Color,
     pub border: Color,
     pub text_dim: Color,
+    /// Whether color output is enabled (false under `NO_COLOR`). Reserved for
+    /// widgets that choose glyphs vs. color to convey state.
+    #[allow(dead_code)]
     pub colored: bool,
 }
 
