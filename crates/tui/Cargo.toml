@@ -1,0 +1,25 @@
+[package]
+name = "piwiplay"
+description = "Console (TUI) DSD audio player over PipeWire."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+default-run = "piwiplay"
+
+[[bin]]
+name = "piwiplay"
+path = "src/main.rs"
+
+[dependencies]
+piwiplay-engine = { path = "../engine" }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+crossbeam-channel.workspace = true
+directories.workspace = true
+ratatui = "0.29"
+crossterm = "0.28"
