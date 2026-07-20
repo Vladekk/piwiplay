@@ -4,11 +4,7 @@
 //! and input, translates keys to engine [`Command`]s, and renders engine
 //! [`Event`]s. All playback logic lives in the engine (see its crate docs).
 
-mod app;
-mod fs_browser;
-mod theme;
-mod ui;
-mod widgets;
+use piwiplay::{app, theme, ui};
 
 use std::io::{self, Stdout};
 use std::path::PathBuf;

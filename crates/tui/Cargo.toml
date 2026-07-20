@@ -9,6 +9,10 @@ repository.workspace = true
 rust-version.workspace = true
 default-run = "piwiplay"
 
+[lib]
+name = "piwiplay"
+path = "src/lib.rs"
+
 [[bin]]
 name = "piwiplay"
 path = "src/main.rs"
