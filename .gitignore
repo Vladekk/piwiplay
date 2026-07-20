@@ -19,3 +19,8 @@ Cargo.lock.orig
 .gitmodules
 .idea
 .vscode
+
+# spike transient artifacts
+spike/test.dsf
+spike/run.log
+spike/pw-cat.c

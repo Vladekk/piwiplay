@@ -1,0 +1,18 @@
+[package]
+name = "piwiplay-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Throwaway crate to de-risk native DSD playback via pipewire-rs (SPEC.md Milestone 0).
+
+[[bin]]
+name = "gen-dsf"
+path = "src/bin/gen_dsf.rs"
+
+[[bin]]
+name = "play-dsd"
+path = "src/main.rs"
+
+[dependencies]
+pipewire = "0.9"
