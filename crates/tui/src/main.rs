@@ -26,6 +26,29 @@ use theme::Theme;
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 fn main() -> Result<()> {
+    // Non-interactive flags so packaging (e.g. Homebrew `test do`) and users can
+    // query the binary without entering the TUI.
+    for a in std::env::args().skip(1) {
+        match a.as_str() {
+            "-V" | "--version" => {
+                println!("piwiplay {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "-h" | "--help" => {
+                println!(
+                    "piwiplay {} — console DSD audio player over PipeWire\n\n\
+                     Usage: piwiplay [FILE|DIR]...\n\n\
+                     With no arguments, starts in the current directory. Files and\n\
+                     folders are queued; folders are scanned recursively for .dsf/.dff.\n\
+                     Press ? inside the app for keybindings.",
+                    env!("CARGO_PKG_VERSION")
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     let paths = Paths::get();
     paths.ensure_dirs();
     let _log_guard = init_logging(&paths);

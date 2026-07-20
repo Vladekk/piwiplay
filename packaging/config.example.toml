@@ -1,0 +1,34 @@
+# piwiplay configuration — copy to ~/.config/piwiplay/config.toml and edit.
+# Every field is optional; anything omitted uses the built-in default shown here.
+
+[audio]
+# Keep DSD bit-perfect: never attenuate in software (see SPEC §5.4).
+allow_pcm_volume = false
+# "" = default PipeWire sink; otherwise a specific node name to target.
+target_sink = ""
+# Ring buffer fill target, milliseconds.
+buffer_ms = 400
+
+[ui]
+theme = "dark"        # "dark" | "light"
+fps = 30              # render tick while playing
+waveform = "braille"  # "braille" | "blocks" | "off"
+min_cols = 60         # below this, show the "terminal too small" notice
+min_rows = 20
+max_content_cols = 200 # clamp/center content on very wide terminals
+
+[theme]
+accent   = "#8ec07c"
+played    = "#83a598"
+unplayed  = "#504945"
+meter_ok  = "#b8bb26"
+meter_warn = "#fabd2f"
+meter_clip = "#fb4934"
+border    = "#665c54"
+text_dim  = "#928374"
+
+# [keymap] overrides default bindings; action = "Key".
+# Actions include: seek_forward_small, seek_back_small, volume_up, volume_down,
+# next, prev, toggle_play, stop, add, remove, save, find, help, quit.
+# [keymap]
+# seek_forward_small = "Right"
