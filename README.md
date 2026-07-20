@@ -44,12 +44,18 @@ and runs against your host session.
 ## Install
 
 ```sh
-# From a checkout:
-cargo install --path crates/tui          # -> ~/.cargo/bin/piwiplay
+# Easiest — puts `piwiplay` on your PATH (~/.cargo/bin), runnable from anywhere:
+make install
+#   ...or, on an immutable/atomic OS where the build needs a toolbox:
+make install-toolbox            # BOX=<name> to pick the toolbox
 
-# Into ~/.local instead of ~/.cargo:
-cargo install --path crates/tui --root ~/.local
+# Equivalent raw commands:
+cargo install --path crates/tui          # -> ~/.cargo/bin/piwiplay
+cargo install --path crates/tui --root ~/.local   # -> ~/.local/bin instead
 ```
+
+Then just `piwiplay ~/Music` from any directory. `make run ARGS=~/Music` runs
+it without installing.
 
 Make sure the target bin dir is on your `PATH`. No system files are written;
 config/state/playlists are created lazily on first run under XDG paths:
