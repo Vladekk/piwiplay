@@ -11,8 +11,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event as CtEvent, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyEventKind,
+};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle};
 use crossterm::execute;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -54,7 +56,7 @@ fn main() -> Result<()> {
     let _log_guard = init_logging(&paths);
 
     let cfg = Config::load();
-    let theme = Theme::from_config(&cfg.theme);
+    let theme = Theme::from_config(&cfg);
 
     // CLI: any args are files/dirs to enqueue; first dir seeds the browser.
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -73,15 +75,17 @@ fn main() -> Result<()> {
 
     let mut app = App::new(engine, cfg, theme, start_dir, paths.playlists_dir.clone());
 
-    let mut terminal = setup_terminal()?;
+    let mouse = app.cfg.ui.mouse;
+    let mut terminal = setup_terminal(mouse)?;
     install_panic_hook();
     let res = run(&mut terminal, &mut app);
-    restore_terminal(&mut terminal)?;
+    restore_terminal(&mut terminal, mouse)?;
     res
 }
 
 fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
     let frame = Duration::from_millis((1000 / app.cfg.ui.fps.max(1)).max(8) as u64);
+    let mut last_title = String::new();
     loop {
         // Drain engine events into the view-model.
         while let Ok(ev) = app.engine.events().try_recv() {
@@ -89,12 +93,20 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
         }
         app.tick();
 
+        // Reflect track + status in the terminal window title (feature 3).
+        let title = app.window_title();
+        if title != last_title {
+            let _ = execute!(io::stdout(), SetTitle(&title));
+            last_title = title;
+        }
+
         terminal.draw(|f| ui::draw(f, app))?;
 
         if event::poll(frame)? {
             match event::read()? {
                 CtEvent::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
-                CtEvent::Resize(_, _) => {} // redraw next loop
+                CtEvent::Mouse(m) => app.on_mouse(m),
+                CtEvent::Resize(_, _) => {}
                 _ => {}
             }
         }
@@ -104,16 +116,22 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
     }
 }
 
-fn setup_terminal() -> Result<Tui> {
+fn setup_terminal(mouse: bool) -> Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    if mouse {
+        execute!(stdout, EnableMouseCapture)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
 
-fn restore_terminal(terminal: &mut Tui) -> Result<()> {
+fn restore_terminal(terminal: &mut Tui, mouse: bool) -> Result<()> {
     disable_raw_mode()?;
+    if mouse {
+        let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
+    }
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
@@ -124,7 +142,7 @@ fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         default(info);
     }));
 }

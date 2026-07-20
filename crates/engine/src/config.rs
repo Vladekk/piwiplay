@@ -33,12 +33,17 @@ pub struct AudioConfig {
 #[serde(default)]
 pub struct UiConfig {
     pub theme: String,
+    /// "terminal" = use the terminal's own 16-color palette (themeable by the
+    /// terminal, e.g. Konsole "Vapor"); "custom" = use the [theme] hex colors.
+    pub palette: String,
     pub fps: u32,
     /// "braille" | "blocks" | "off"
     pub waveform: String,
     pub min_cols: u16,
     pub min_rows: u16,
     pub max_content_cols: u16,
+    /// Enable mouse support (click to select/seek, wheel to scroll).
+    pub mouse: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,11 +69,13 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: "dark".into(),
+            palette: "terminal".into(),
             fps: 30,
             waveform: "braille".into(),
             min_cols: 60,
             min_rows: 20,
             max_content_cols: 200,
+            mouse: true,
         }
     }
 }

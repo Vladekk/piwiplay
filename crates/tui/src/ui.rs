@@ -1,4 +1,5 @@
 //! Rendering: layout with size breakpoints, colored/unicode widgets, overlays.
+//! Also records mouse hit-areas (list rows, seek bar) into `app.hit`.
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -8,7 +9,8 @@ use ratatui::Frame;
 
 use piwiplay_engine::{OutputMode, Transport};
 
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, VERSION};
+use crate::fs_browser::Browser;
 use crate::widgets::{bar_parts, braille_waveform, fmt_time};
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -19,18 +21,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_too_small(f, full, min_c, min_r);
         return;
     }
-
-    // Clamp absurdly wide terminals to a readable width, centered.
     let area = clamp_width(full, app.cfg.ui.max_content_cols);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // status
-            Constraint::Min(6),    // main
-            Constraint::Length(3), // transport
-            Constraint::Length(1), // hints
-        ])
+        .constraints([Constraint::Length(3), Constraint::Min(6), Constraint::Length(3), Constraint::Length(1)])
         .split(area);
 
     render_status(f, rows[0], app);
@@ -48,8 +43,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn clamp_width(area: Rect, max_cols: u16) -> Rect {
     if max_cols >= 20 && area.width > max_cols {
-        let x = area.x + (area.width - max_cols) / 2;
-        Rect { x, y: area.y, width: max_cols, height: area.height }
+        Rect { x: area.x + (area.width - max_cols) / 2, y: area.y, width: max_cols, height: area.height }
     } else {
         area
     }
@@ -57,10 +51,9 @@ fn clamp_width(area: Rect, max_cols: u16) -> Rect {
 
 fn draw_too_small(f: &mut Frame, area: Rect, min_c: u16, min_r: u16) {
     let msg = format!("Terminal too small\nneed ≥ {min_c}×{min_r}\n({}×{} now)", area.width, area.height);
-    let p = Paragraph::new(msg).alignment(Alignment::Center).wrap(Wrap { trim: true });
     let inner = center_rect(area, 30, 3);
     f.render_widget(Clear, inner);
-    f.render_widget(p, inner);
+    f.render_widget(Paragraph::new(msg).alignment(Alignment::Center).wrap(Wrap { trim: true }), inner);
 }
 
 fn render_status(f: &mut Frame, area: Rect, app: &App) {
@@ -78,14 +71,13 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
                 app.mode.label()
             )
         })
-        .unwrap_or_else(|| "—".into());
+        .unwrap_or_else(|| format!("— · {}", app.mode.label()));
 
     let state = match app.transport {
         Transport::Playing => "▶ Playing",
         Transport::Paused => "⏸ Paused",
         Transport::Stopped => "■ Stopped",
     };
-
     let title = app.track.as_ref().map(|t| t.display_title()).unwrap_or_else(|| "no track".into());
     let mode_color = match app.mode {
         OutputMode::Native => th.meter_ok,
@@ -99,7 +91,6 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(th.border))
         .title(Span::styled(" piwiplay ", Style::default().fg(th.accent).add_modifier(Modifier::BOLD)))
         .title_top(Line::from(Span::styled(format!(" {badge} "), Style::default().fg(mode_color))).right_aligned());
-
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -119,7 +110,7 @@ fn render_main(f: &mut Frame, area: Rect, app: &App) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
             .split(area);
-        render_list(f, cols[0], app);
+        render_focused_list(f, cols[0], app);
         let right = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(4), Constraint::Length(4)])
@@ -127,85 +118,105 @@ fn render_main(f: &mut Frame, area: Rect, app: &App) {
         render_waveform(f, right[0], app);
         render_levels(f, right[1], app);
     } else {
-        render_list(f, area, app);
+        render_focused_list(f, area, app);
     }
 }
 
-fn render_list(f: &mut Frame, area: Rect, app: &App) {
+fn render_focused_list(f: &mut Frame, area: Rect, app: &App) {
+    match app.focus {
+        Focus::Browser => render_browser(f, area, app, &app.browser),
+        Focus::Saved => render_browser(f, area, app, &app.saved),
+        Focus::Queue => render_queue(f, area, app),
+    }
+}
+
+fn pane_title(app: &App) -> String {
+    let cycle = match app.focus {
+        Focus::Browser => "Tab→Playlist",
+        Focus::Queue => "Tab→Saved",
+        Focus::Saved => "Tab→Browser",
+    };
+    format!(" {} ({cycle}) ", app.focus.title())
+}
+
+fn render_browser(f: &mut Frame, area: Rect, app: &App, br: &Browser) {
     let th = &app.theme;
-    let (title, focused) = match app.focus {
-        Focus::Browser => (" Browser ", true),
-        Focus::Playlist => (" Playlist ", true),
-    };
-    let other = match app.focus {
-        Focus::Browser => "Playlist",
-        Focus::Playlist => "Browser",
-    };
-    let border_color = if focused { th.accent } else { th.border };
+    let subtitle = format!("{}  [{}]", pane_title(app), br.cwd.display());
+    let items: Vec<ListItem> = br
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let (icon, mut style) = if e.is_parent {
+                ("▸ ", Style::default().fg(th.text_dim))
+            } else if e.is_dir {
+                ("▾ ", Style::default().fg(th.accent))
+            } else if e.is_playlist {
+                ("≣ ", Style::default().fg(th.text_dim))
+            } else {
+                ("♫ ", Style::default())
+            };
+            if br.marked.contains(&i) {
+                style = style.add_modifier(Modifier::BOLD).fg(th.played);
+            }
+            let mark = if br.marked.contains(&i) { "●" } else { " " };
+            ListItem::new(Line::from(vec![
+                Span::styled(mark, Style::default().fg(th.played)),
+                Span::styled(icon, style),
+                Span::styled(e.name.clone(), style),
+            ]))
+        })
+        .collect();
 
-    let items: Vec<ListItem> = match app.focus {
-        Focus::Browser => app
-            .browser
-            .entries
-            .iter()
-            .map(|e| {
-                let (icon, style) = if e.is_parent {
-                    ("▸ ", Style::default().fg(th.text_dim))
-                } else if e.is_dir {
-                    ("▾ ", Style::default().fg(th.accent))
-                } else if e.is_playlist {
-                    ("≣ ", Style::default().fg(th.text_dim))
-                } else {
-                    ("♫ ", Style::default())
-                };
-                ListItem::new(Line::from(vec![Span::styled(icon, style), Span::raw(e.name.clone())]))
-            })
-            .collect(),
-        Focus::Playlist => app
-            .playlist
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let playing = Some(i) == app.playlist_cur;
-                let icon = if playing { "♪ " } else { "  " };
-                let mut style = Style::default();
-                if t.missing {
-                    style = style.fg(app.theme.meter_clip).add_modifier(Modifier::DIM);
-                }
-                if playing {
-                    style = style.fg(app.theme.accent).add_modifier(Modifier::BOLD);
-                }
-                let label = if t.missing { format!("! {}", t.display_title()) } else { t.display_title() };
-                ListItem::new(Line::from(vec![Span::raw(icon), Span::styled(label, style)]))
-            })
-            .collect(),
-    };
-
-    let hint = format!("{title}(Tab → {other})");
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(hint, Style::default().fg(th.accent)));
-
+        .border_style(Style::default().fg(th.accent))
+        .title(Span::styled(subtitle, Style::default().fg(th.accent)));
+    let inner = block.inner(area);
     let mut state = ListState::default();
-    let sel = match app.focus {
-        Focus::Browser => app.browser.selected,
-        Focus::Playlist => app.playlist_sel,
-    };
-    state.select(if list_len(app) == 0 { None } else { Some(sel) });
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("");
+    state.select(if br.entries.is_empty() { None } else { Some(br.selected) });
+    let list = List::new(items).block(block).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, area, &mut state);
+
+    let mut hit = app.hit.borrow_mut();
+    hit.list = Some(inner);
+    hit.list_offset = state.offset();
 }
 
-fn list_len(app: &App) -> usize {
-    match app.focus {
-        Focus::Browser => app.browser.entries.len(),
-        Focus::Playlist => app.playlist.len(),
-    }
+fn render_queue(f: &mut Frame, area: Rect, app: &App) {
+    let th = &app.theme;
+    let items: Vec<ListItem> = app
+        .playlist
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let playing = Some(i) == app.playlist_cur;
+            let icon = if playing { "♪ " } else { "  " };
+            let mut style = Style::default();
+            if t.missing {
+                style = style.fg(th.meter_clip).add_modifier(Modifier::DIM);
+            }
+            if playing {
+                style = style.fg(th.accent).add_modifier(Modifier::BOLD);
+            }
+            let label = if t.missing { format!("! {}", t.display_title()) } else { t.display_title() };
+            ListItem::new(Line::from(vec![Span::raw(icon), Span::styled(label, style)]))
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th.accent))
+        .title(Span::styled(pane_title(app), Style::default().fg(th.accent)));
+    let inner = block.inner(area);
+    let mut state = ListState::default();
+    state.select(if app.playlist.is_empty() { None } else { Some(app.playlist_sel) });
+    let list = List::new(items).block(block).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, area, &mut state);
+
+    let mut hit = app.hit.borrow_mut();
+    hit.list = Some(inner);
+    hit.list_offset = state.offset();
 }
 
 fn render_waveform(f: &mut Frame, area: Rect, app: &App) {
@@ -216,22 +227,22 @@ fn render_waveform(f: &mut Frame, area: Rect, app: &App) {
         .title(Span::styled(" Waveform ", Style::default().fg(th.text_dim)));
     let inner = block.inner(area);
     f.render_widget(block, area);
-
-    let w = inner.width as usize;
-    let h = inner.height as usize;
+    let (w, h) = (inner.width as usize, inner.height as usize);
     if w == 0 || h == 0 {
         return;
     }
     let wave = app.waveform.clone();
+    // Absolute amplitude with a gentle curve for low-level visibility and a
+    // little headroom so peaks/transients stand out instead of a solid block.
     let amp_at = |x: f64| -> f64 {
         if wave.is_empty() {
             return 0.0;
         }
         let idx = (x * (wave.len() - 1) as f64).round() as usize;
-        wave[idx.min(wave.len() - 1)].peak as f64
+        let a = wave[idx.min(wave.len() - 1)].peak as f64;
+        a.powf(0.85).min(0.96)
     };
     let rows = braille_waveform(w, h, amp_at);
-
     let playhead_frac = frac(app.elapsed.as_secs_f64(), app.total.as_secs_f64());
     let played_cells = (playhead_frac * w as f64).round() as usize;
 
@@ -261,14 +272,9 @@ fn render_levels(f: &mut Frame, area: Rect, app: &App) {
     if inner.height == 0 {
         return;
     }
-
-    // v1: single mono-derived level shown on L and R (see SPEC §8.3 limitation).
     let level = current_level(app);
     let bar_w = inner.width.saturating_sub(8) as usize;
-    let mut lines = Vec::new();
-    for label in ["L", "R"] {
-        lines.push(meter_line(label, level, bar_w, th));
-    }
+    let lines: Vec<Line> = ["L", "R"].iter().map(|l| meter_line(l, level, bar_w, th)).collect();
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -284,9 +290,11 @@ fn current_level(app: &App) -> f32 {
 fn meter_line<'a>(label: &'a str, level: f32, width: usize, th: &crate::theme::Theme) -> Line<'a> {
     let (full, partial, rest) = bar_parts(width, level as f64);
     let color = th.meter_color(level);
-    let mut spans = vec![Span::styled(format!("{label} "), Style::default().fg(th.text_dim))];
-    spans.push(Span::styled("▕", Style::default().fg(th.border)));
-    spans.push(Span::styled("█".repeat(full), Style::default().fg(color)));
+    let mut spans = vec![
+        Span::styled(format!("{label} "), Style::default().fg(th.text_dim)),
+        Span::styled("▕", Style::default().fg(th.border)),
+        Span::styled("█".repeat(full), Style::default().fg(color)),
+    ];
     if let Some(c) = partial {
         spans.push(Span::styled(c.to_string(), Style::default().fg(color)));
     }
@@ -301,8 +309,7 @@ fn render_transport(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Left: elapsed  seekbar  total.  Right: volume.
-    let vol_w = 18u16.min(inner.width / 3);
+    let vol_w = 20u16.min(inner.width / 3);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(10), Constraint::Length(vol_w)])
@@ -310,11 +317,12 @@ fn render_transport(f: &mut Frame, area: Rect, app: &App) {
 
     // seek bar
     let seek_frac = frac(app.elapsed.as_secs_f64(), app.total.as_secs_f64());
-    let labels_w = 14usize;
-    let bar_w = (cols[0].width as usize).saturating_sub(labels_w);
+    let elapsed_lbl = format!("{:>5} ", fmt_time(app.elapsed));
+    let total_lbl = format!(" {:>5}", fmt_time(app.total));
+    let bar_w = (cols[0].width as usize).saturating_sub(elapsed_lbl.len() + total_lbl.len() + 2);
     let (full, partial, rest) = bar_parts(bar_w, seek_frac);
     let mut spans = vec![
-        Span::styled(format!("{:>5} ", fmt_time(app.elapsed)), Style::default().fg(th.text_dim)),
+        Span::styled(elapsed_lbl.clone(), Style::default().fg(th.text_dim)),
         Span::styled("▕", Style::default().fg(th.border)),
         Span::styled("█".repeat(full), Style::default().fg(th.played)),
     ];
@@ -323,15 +331,25 @@ fn render_transport(f: &mut Frame, area: Rect, app: &App) {
     }
     spans.push(Span::styled("░".repeat(rest), Style::default().fg(th.unplayed)));
     spans.push(Span::styled("▏", Style::default().fg(th.border)));
-    spans.push(Span::styled(format!(" {:>5}", fmt_time(app.total)), Style::default().fg(th.text_dim)));
+    spans.push(Span::styled(total_lbl, Style::default().fg(th.text_dim)));
     f.render_widget(Paragraph::new(Line::from(spans)), cols[0]);
 
+    // record seek-bar hit region (the filled track between the ▕ ▏ guards)
+    let seek_x = cols[0].x + elapsed_lbl.len() as u16 + 1;
+    app.hit.borrow_mut().seek = Some(Rect { x: seek_x, y: cols[0].y, width: bar_w as u16, height: 1 });
+
     // volume
-    let vlabel = if app.muted { "mute".to_string() } else { format!("{:>3}%", (app.volume * 100.0) as u32) };
-    let vbar_w = (cols[1].width as usize).saturating_sub(7);
+    let vlabel = if app.muted {
+        "mute".to_string()
+    } else if app.vol_effective {
+        format!("{:>3}%", (app.volume * 100.0) as u32)
+    } else {
+        format!("{:>3}%·fix", (app.volume * 100.0) as u32) // bit-perfect: fixed, use DAC
+    };
+    // Reserve room for the "♪▕" prefix (2), a space, and the label.
+    let vbar_w = (cols[1].width as usize).saturating_sub(vlabel.len() + 4);
     let (vf, vp, vr) = bar_parts(vbar_w, if app.muted { 0.0 } else { app.volume });
-    let mut vspans = vec![Span::styled("♪", Style::default().fg(th.accent))];
-    vspans.push(Span::styled("▕", Style::default().fg(th.border)));
+    let mut vspans = vec![Span::styled("♪", Style::default().fg(th.accent)), Span::styled("▕", Style::default().fg(th.border))];
     vspans.push(Span::styled("█".repeat(vf), Style::default().fg(th.accent)));
     if let Some(c) = vp {
         vspans.push(Span::styled(c.to_string(), Style::default().fg(th.accent)));
@@ -343,47 +361,63 @@ fn render_transport(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_hints(f: &mut Frame, area: Rect, app: &App) {
     let th = &app.theme;
+    if let Some((label, buf)) = &app.prompt {
+        let p = Paragraph::new(Line::from(vec![
+            Span::styled(format!("{label}: "), Style::default().fg(th.accent)),
+            Span::raw(buf.clone()),
+            Span::styled("▏  (Enter save · Esc cancel)", Style::default().fg(th.text_dim)),
+        ]));
+        f.render_widget(p, area);
+        return;
+    }
     if let Some(buf) = &app.find {
         let p = Paragraph::new(Line::from(vec![
             Span::styled("/", Style::default().fg(th.accent)),
             Span::raw(buf.clone()),
-            Span::styled("  (Esc to cancel)", Style::default().fg(th.text_dim)),
+            Span::styled("  (Esc)", Style::default().fg(th.text_dim)),
         ]));
         f.render_widget(p, area);
         return;
     }
     let extra = format!("  repeat:{} shuffle:{}", app.repeat.label(), if app.shuffle { "on" } else { "off" });
-    let hints = "space play/pause  ←→ seek  n/p track  ⏎ open  a add  d del  x save  z r  / find  ? help  q quit";
-    let line = Line::from(vec![
-        Span::styled(hints, Style::default().fg(th.text_dim)),
-        Span::styled(extra, Style::default().fg(th.accent)),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    let hints = "space ⏎ ←→seek n/p  t transcode  a add  X save-as  L music  Tab panes  / find  ? help  q quit";
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(hints, Style::default().fg(th.text_dim)),
+            Span::styled(extra, Style::default().fg(th.accent)),
+        ])),
+        area,
+    );
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let text = "\
- piwiplay — keys
+    let text = format!(
+        "\
+ piwiplay {VERSION} — keys
 
- space   play / pause          ⏎     open dir / play file
+ space   play / pause          ⏎     open / play / add marked
  S       stop                  a     add selection to playlist
- n / p   next / previous       d     remove from playlist
- ← →     seek ∓5s              x     save playlist
- Shift←→ seek ∓30s             o/⏎   load .m3u (browser)
- [ ] -+  volume                Tab   switch Browser/Playlist
- m       mute                  ↑↓ kj move   g/G top/bottom
- r       repeat cycle          /     find
- z       shuffle               ? close help   q quit
-";
-    let inner = center_rect(area, 64, 16);
+ n / p   next / previous       d     remove from playlist (Playlist)
+ ← →     seek ∓5s              x     save playlist (default name)
+ Shift←→ seek ∓30s             X     save playlist as… (Shift+x)
+ [ ] - + volume                t     toggle native DSD ⇄ transcode(PCM)
+ m       mute                        (PCM enables software volume)
+ r       repeat cycle          L     jump to system music library
+ z       shuffle               Tab   cycle Browser→Playlist→Saved
+ ↑↓ k j  move selection        S-Tab cycle panes backward
+ Shift+↑↓ multi-select         PgUp/PgDn  first / last item
+ /       find                  mouse click=select, dblclick=play,
+ ?       close help  q quit           wheel=scroll, click bar=seek
+"
+    );
+    let inner = center_rect(area, 70, 20);
     f.render_widget(Clear, inner);
-    let block = Block::default().borders(Borders::ALL).title(" Help ");
-    let p = Paragraph::new(text).block(block);
-    f.render_widget(p, inner);
+    let block = Block::default().borders(Borders::ALL).title(format!(" Help — piwiplay {VERSION} "));
+    f.render_widget(Paragraph::new(text).block(block), inner);
 }
 
 fn draw_message(f: &mut Frame, area: Rect, msg: &str, app: &App) {
-    let w = (msg.len() as u16 + 4).min(area.width.saturating_sub(2));
+    let w = (msg.chars().count() as u16 + 4).min(area.width.saturating_sub(2));
     let rect = Rect { x: area.x + 1, y: area.y + area.height.saturating_sub(5), width: w, height: 3 };
     f.render_widget(Clear, rect);
     let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(app.theme.accent));

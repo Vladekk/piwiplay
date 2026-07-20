@@ -12,6 +12,7 @@ pub mod audio;
 pub mod config;
 pub mod decode;
 pub mod error;
+pub mod pcm;
 pub mod player;
 pub mod playlist;
 pub mod types;

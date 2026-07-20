@@ -1,26 +1,23 @@
-//! Native-DSD PipeWire sink.
+//! PipeWire sink supporting two output paths (spec-v2):
 //!
-//! Two threads:
-//! * **sink thread** — owns the PipeWire main loop + stream. The RT `process`
-//!   callback only drains the [`Ring`] into the output buffer (a `memcpy`); it
-//!   never touches disk or allocates on the hot path. Command handling and
-//!   format negotiation also run here (loop thread).
-//! * **feeder thread** — owns the [`Decoder`], reads planar DSD, repacks it into
-//!   the negotiated layout in group-aligned chunks, and pushes to the ring. It
-//!   also emits throttled position updates and end-of-track detection.
+//! * **Native DSD** — bit-perfect 1-bit passthrough (v1), volume fixed.
+//! * **PCM** — interleaved f32 from the ffmpeg decoder (any format, or DSD
+//!   transcoded), with software volume applied in the feeder.
 //!
-//! Control flows in via [`pipewire::channel`]; events flow out via a
-//! crossbeam channel. See `spike/RESULTS.md` for the negotiation details.
+//! Threads: a **sink thread** owning the PipeWire loop + stream (the RT
+//! `process` callback only drains the ring), and a **feeder thread** that reads
+//! the active source (DSD decoder or PCM subprocess) and fills the ring.
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use pipewire as pw;
 use pw::{properties::properties, spa};
+use spa::param::audio::{AudioFormat, AudioInfoRaw, MAX_CHANNELS};
 use spa::pod::serialize::PodSerializer;
 use spa::pod::{Object, Pod, Property, Value, ValueArray};
 use spa::sys;
@@ -29,79 +26,95 @@ use spa::utils::Id;
 use super::{repack_planar, Layout};
 use crate::audio::ring::Ring;
 use crate::decode::Decoder;
+use crate::pcm::{apply_gain_f32le, PcmInfo, PcmSource};
 use crate::types::{DsdInfo, OutputMode, Transport};
 
-/// Ring capacity: enough for ~0.5s of the highest supported rate (DSD512
-/// stereo ≈ 2.8 MB/s). Fixed so the RT callback keeps a stable Arc.
 const RING_CAPACITY: usize = 4 * 1024 * 1024;
-
-/// Per-channel bytes to read from the decoder per feeder iteration.
 const READ_CHUNK: usize = 64 * 1024;
-
-/// Idle DSD byte used to pad the final partial group (keeps buffers stride-aligned).
 const DSD_IDLE: u8 = 0x69;
 
-/// Commands accepted by the sink (delivered into the loop thread).
+const MODE_NONE: u8 = 0;
+const MODE_DSD: u8 = 1;
+const MODE_PCM: u8 = 2;
+
+/// Commands accepted by the sink.
 pub enum SinkCmd {
-    /// Load a decoder and begin playing it.
-    Play { decoder: Box<dyn Decoder>, info: DsdInfo },
+    /// Native DSD playback of a decoder.
+    PlayDsd { decoder: Box<dyn Decoder>, info: DsdInfo },
+    /// PCM playback from an ffmpeg source (any format / transcoded DSD).
+    PlayPcm { source: Box<PcmSource>, info: PcmInfo, start_secs: f64 },
     Pause,
     Resume,
     Stop,
+    /// DSD-path seek (per-channel byte offset). PCM seeks by re-issuing PlayPcm.
     SeekBytes(u64),
+    /// Software volume 0.0..=1.0 (applied on the PCM path only).
+    SetVolume(f32),
     Quit,
 }
 
-/// Events emitted by the sink.
 #[derive(Debug, Clone)]
 pub enum SinkEvent {
-    Negotiated { layout: Layout, mode: OutputMode },
-    /// Per-channel bytes played (maps to time via `DsdInfo::spa_rate`).
-    PositionBytes(u64),
+    Negotiated { mode: OutputMode },
+    /// Elapsed playback position in seconds (path-independent).
+    PositionSecs(f64),
     TrackEnded,
     Transport(Transport),
     Error(String),
 }
 
-/// Commands from the sink thread to the feeder thread.
 enum FeedCmd {
-    Load { decoder: Box<dyn Decoder>, src_lsb: bool, channels: usize, base_per_chan: u64 },
+    LoadDsd { decoder: Box<dyn Decoder>, src_lsb: bool, channels: usize, spa_rate: u32, base_bytes: u64 },
+    LoadPcm { source: Box<PcmSource>, base_secs: f64 },
     Seek(u64),
     Stop,
     Quit,
 }
 
-/// Handle owning both threads; drop stops them.
 pub struct Sink {
     tx: pw::channel::Sender<SinkCmd>,
     sink_thread: Option<JoinHandle<()>>,
     feeder_thread: Option<JoinHandle<()>>,
 }
 
+/// State shared between the sink and feeder threads.
+#[derive(Clone)]
+struct Shared {
+    ring: Ring,
+    layout: Arc<Mutex<Option<Layout>>>,
+    stride: Arc<AtomicUsize>,
+    paused: Arc<AtomicBool>,
+    channels: Arc<AtomicU32>,
+    mode: Arc<AtomicU8>,
+    volume: Arc<Mutex<f32>>,
+}
+
 impl Sink {
     pub fn spawn(events: crossbeam_channel::Sender<SinkEvent>) -> Self {
-        let ring = Ring::new(RING_CAPACITY);
-        let layout: Arc<Mutex<Option<Layout>>> = Arc::new(Mutex::new(None));
-        let paused = Arc::new(AtomicBool::new(true));
-        let channels = Arc::new(AtomicU32::new(2));
-
+        let shared = Shared {
+            ring: Ring::new(RING_CAPACITY),
+            layout: Arc::new(Mutex::new(None)),
+            stride: Arc::new(AtomicUsize::new(0)),
+            paused: Arc::new(AtomicBool::new(true)),
+            channels: Arc::new(AtomicU32::new(2)),
+            mode: Arc::new(AtomicU8::new(MODE_NONE)),
+            volume: Arc::new(Mutex::new(0.7)),
+        };
         let (feed_tx, feed_rx) = mpsc::channel::<FeedCmd>();
         let (cmd_tx, cmd_rx) = pw::channel::channel::<SinkCmd>();
 
         let feeder_thread = {
-            let ring = ring.clone();
-            let layout = layout.clone();
+            let shared = shared.clone();
             let events = events.clone();
             thread::Builder::new()
                 .name("piwiplay-feeder".into())
-                .spawn(move || feeder_loop(feed_rx, ring, layout, events))
+                .spawn(move || feeder_loop(feed_rx, shared, events))
                 .expect("spawn feeder")
         };
-
         let sink_thread = thread::Builder::new()
             .name("piwiplay-sink".into())
             .spawn(move || {
-                if let Err(e) = sink_loop(cmd_rx, feed_tx, ring, layout, paused, channels, events.clone()) {
+                if let Err(e) = sink_loop(cmd_rx, feed_tx, shared, events.clone()) {
                     let _ = events.send(SinkEvent::Error(e));
                 }
             })
@@ -127,7 +140,6 @@ impl Drop for Sink {
     }
 }
 
-/// Read interleave + bitorder chosen by the sink from a negotiated Format POD.
 fn parse_negotiated(param: &Pod, fallback_channels: usize) -> Option<Layout> {
     let obj = param.as_object().ok()?;
     let interleave = obj
@@ -147,18 +159,20 @@ fn parse_negotiated(param: &Pod, fallback_channels: usize) -> Option<Layout> {
     Some(Layout { interleave, dst_lsb, channels })
 }
 
-/// Build the DSD EnumFormat POD (no interleave/bitorder — the sink picks them).
-fn build_format(info: &DsdInfo) -> Vec<u8> {
-    let positions: Vec<Id> = match info.channels {
+fn dsd_positions(channels: u32) -> Vec<Id> {
+    match channels {
         1 => vec![Id(sys::SPA_AUDIO_CHANNEL_MONO)],
-        _ => (0..info.channels)
+        _ => (0..channels)
             .map(|i| match i {
                 0 => Id(sys::SPA_AUDIO_CHANNEL_FL),
                 1 => Id(sys::SPA_AUDIO_CHANNEL_FR),
                 n => Id(sys::SPA_AUDIO_CHANNEL_AUX0 + n),
             })
             .collect(),
-    };
+    }
+}
+
+fn build_dsd_format(info: &DsdInfo) -> Vec<u8> {
     let obj = Object {
         type_: sys::SPA_TYPE_OBJECT_Format,
         id: sys::SPA_PARAM_EnumFormat,
@@ -167,23 +181,40 @@ fn build_format(info: &DsdInfo) -> Vec<u8> {
             Property::new(sys::SPA_FORMAT_mediaSubtype, Value::Id(Id(sys::SPA_MEDIA_SUBTYPE_dsd))),
             Property::new(sys::SPA_FORMAT_AUDIO_rate, Value::Int(info.spa_rate() as i32)),
             Property::new(sys::SPA_FORMAT_AUDIO_channels, Value::Int(info.channels as i32)),
-            Property::new(sys::SPA_FORMAT_AUDIO_position, Value::ValueArray(ValueArray::Id(positions))),
+            Property::new(
+                sys::SPA_FORMAT_AUDIO_position,
+                Value::ValueArray(ValueArray::Id(dsd_positions(info.channels))),
+            ),
         ],
     };
-    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
-        .expect("serialize dsd format")
-        .0
-        .into_inner()
+    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj)).unwrap().0.into_inner()
 }
 
-#[allow(clippy::too_many_arguments)]
+fn build_pcm_format(info: &PcmInfo) -> Vec<u8> {
+    let mut ai = AudioInfoRaw::new();
+    ai.set_format(AudioFormat::F32LE);
+    ai.set_rate(info.rate);
+    ai.set_channels(info.channels);
+    let mut pos = [0u32; MAX_CHANNELS];
+    if info.channels >= 2 {
+        pos[0] = sys::SPA_AUDIO_CHANNEL_FL;
+        pos[1] = sys::SPA_AUDIO_CHANNEL_FR;
+    } else {
+        pos[0] = sys::SPA_AUDIO_CHANNEL_MONO;
+    }
+    ai.set_position(pos);
+    let obj = Object {
+        type_: sys::SPA_TYPE_OBJECT_Format,
+        id: sys::SPA_PARAM_EnumFormat,
+        properties: ai.into(),
+    };
+    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj)).unwrap().0.into_inner()
+}
+
 fn sink_loop(
     cmd_rx: pw::channel::Receiver<SinkCmd>,
     feed_tx: mpsc::Sender<FeedCmd>,
-    ring: Ring,
-    layout: Arc<Mutex<Option<Layout>>>,
-    paused: Arc<AtomicBool>,
-    channels: Arc<AtomicU32>,
+    shared: Shared,
     events: crossbeam_channel::Sender<SinkEvent>,
 ) -> Result<(), String> {
     pw::init();
@@ -203,13 +234,9 @@ fn sink_loop(
     )
     .map_err(|e| e.to_string())?;
 
-    // Listener: process (RT drain), param_changed (negotiation), state_changed.
     let _listener = {
-        let ring = ring.clone();
-        let layout_p = layout.clone();
-        let paused_p = paused.clone();
-        let layout_pc = layout.clone();
-        let channels_pc = channels.clone();
+        let s = shared.clone();
+        let s_pc = shared.clone();
         let events_pc = events.clone();
         let events_sc = events.clone();
         stream
@@ -218,12 +245,12 @@ fn sink_loop(
                 let Some(mut buffer) = stream.dequeue_buffer() else { return };
                 let datas = buffer.datas_mut();
                 let Some(data) = datas.first_mut() else { return };
-                let stride = layout_p.lock().unwrap().map(|l| l.stride()).unwrap_or(1).max(1);
+                let stride = s.stride.load(Ordering::Acquire).max(1);
                 let mut written = 0usize;
                 if let Some(slice) = data.data() {
                     let cap = (slice.len() / stride) * stride;
-                    if !paused_p.load(Ordering::Acquire) && cap > 0 {
-                        written = ring.read_into(&mut slice[..cap]);
+                    if !s.paused.load(Ordering::Acquire) && cap > 0 {
+                        written = s.ring.read_into(&mut slice[..cap]);
                     }
                 }
                 let chunk = data.chunk_mut();
@@ -232,15 +259,15 @@ fn sink_loop(
                 *chunk.size_mut() = written as u32;
             })
             .param_changed(move |_, _, id, param| {
-                if id != sys::SPA_PARAM_Format {
+                if id != sys::SPA_PARAM_Format || s_pc.mode.load(Ordering::Acquire) != MODE_DSD {
                     return;
                 }
                 let Some(param) = param else { return };
-                let fallback = channels_pc.load(Ordering::Relaxed) as usize;
+                let fallback = s_pc.channels.load(Ordering::Relaxed) as usize;
                 if let Some(l) = parse_negotiated(param, fallback) {
-                    *layout_pc.lock().unwrap() = Some(l);
-                    // v1: we only ever offer DSD, so a negotiated DSD format is native.
-                    let _ = events_pc.send(SinkEvent::Negotiated { layout: l, mode: OutputMode::Native });
+                    *s_pc.layout.lock().unwrap() = Some(l);
+                    s_pc.stride.store(l.stride(), Ordering::Release);
+                    let _ = events_pc.send(SinkEvent::Negotiated { mode: OutputMode::Native });
                 }
             })
             .state_changed(move |_, _, _old, new| {
@@ -253,73 +280,96 @@ fn sink_loop(
             .map_err(|e| e.to_string())?
     };
 
-    // Shared control state for the command handler.
     let connected = Rc::new(RefCell::new(false));
-
     let ml_for_cmd = mainloop.clone();
+
     let _attached = cmd_rx.attach(mainloop.loop_(), {
         let stream = stream.clone();
-        let ring = ring.clone();
-        let layout = layout.clone();
-        let paused = paused.clone();
-        let channels = channels.clone();
+        let shared = shared.clone();
         let events = events.clone();
         let feed_tx = feed_tx.clone();
-        move |cmd| match cmd {
-            SinkCmd::Play { decoder, info } => {
-                ring.reset();
-                *layout.lock().unwrap() = None;
-                channels.store(info.channels, Ordering::Relaxed);
-                let src_lsb = matches!(info.bit_order, crate::types::BitOrder::Lsb);
-                let _ = feed_tx.send(FeedCmd::Load {
-                    decoder,
-                    src_lsb,
-                    channels: info.channels as usize,
-                    base_per_chan: 0,
-                });
-
+        move |cmd| {
+            let connect = |values: Vec<u8>| -> Result<(), pw::Error> {
                 if *connected.borrow() {
                     let _ = stream.disconnect();
                 }
-                let values = build_format(&info);
                 let mut params = [Pod::from_bytes(&values).unwrap()];
-                if let Err(e) = stream.connect(
+                stream.connect(
                     spa::utils::Direction::Output,
                     None,
                     pw::stream::StreamFlags::AUTOCONNECT
                         | pw::stream::StreamFlags::MAP_BUFFERS
                         | pw::stream::StreamFlags::RT_PROCESS,
                     &mut params,
-                ) {
-                    let _ = events.send(SinkEvent::Error(format!("connect failed: {e}")));
-                    return;
-                }
+                )?;
                 *connected.borrow_mut() = true;
-                paused.store(false, Ordering::Release);
-                let _ = stream.set_active(true);
-                let _ = events.send(SinkEvent::Transport(Transport::Playing));
-            }
-            SinkCmd::Pause => {
-                paused.store(true, Ordering::Release);
-                let _ = events.send(SinkEvent::Transport(Transport::Paused));
-            }
-            SinkCmd::Resume => {
-                paused.store(false, Ordering::Release);
-                let _ = events.send(SinkEvent::Transport(Transport::Playing));
-            }
-            SinkCmd::Stop => {
-                paused.store(true, Ordering::Release);
-                let _ = feed_tx.send(FeedCmd::Stop);
-                ring.reset();
-                let _ = events.send(SinkEvent::Transport(Transport::Stopped));
-            }
-            SinkCmd::SeekBytes(b) => {
-                ring.reset();
-                let _ = feed_tx.send(FeedCmd::Seek(b));
-            }
-            SinkCmd::Quit => {
-                let _ = feed_tx.send(FeedCmd::Quit);
-                ml_for_cmd.quit();
+                Ok(())
+            };
+            match cmd {
+                SinkCmd::PlayDsd { decoder, info } => {
+                    shared.ring.reset();
+                    *shared.layout.lock().unwrap() = None;
+                    shared.stride.store(0, Ordering::Release);
+                    shared.channels.store(info.channels, Ordering::Relaxed);
+                    shared.mode.store(MODE_DSD, Ordering::Release);
+                    let src_lsb = matches!(info.bit_order, crate::types::BitOrder::Lsb);
+                    let _ = feed_tx.send(FeedCmd::LoadDsd {
+                        decoder,
+                        src_lsb,
+                        channels: info.channels as usize,
+                        spa_rate: info.spa_rate(),
+                        base_bytes: 0,
+                    });
+                    if let Err(e) = connect(build_dsd_format(&info)) {
+                        let _ = events.send(SinkEvent::Error(format!("connect failed: {e}")));
+                        return;
+                    }
+                    shared.paused.store(false, Ordering::Release);
+                    let _ = stream.set_active(true);
+                    let _ = events.send(SinkEvent::Transport(Transport::Playing));
+                }
+                SinkCmd::PlayPcm { source, info, start_secs } => {
+                    shared.ring.reset();
+                    *shared.layout.lock().unwrap() = None;
+                    shared.channels.store(info.channels, Ordering::Relaxed);
+                    shared.stride.store(info.stride(), Ordering::Release);
+                    shared.mode.store(MODE_PCM, Ordering::Release);
+                    let _ = feed_tx.send(FeedCmd::LoadPcm { source, base_secs: start_secs });
+                    if let Err(e) = connect(build_pcm_format(&info)) {
+                        let _ = events.send(SinkEvent::Error(format!("connect failed: {e}")));
+                        return;
+                    }
+                    shared.paused.store(false, Ordering::Release);
+                    let _ = stream.set_active(true);
+                    let _ = events.send(SinkEvent::Negotiated { mode: OutputMode::Transcoded });
+                    let _ = events.send(SinkEvent::Transport(Transport::Playing));
+                }
+                SinkCmd::Pause => {
+                    shared.paused.store(true, Ordering::Release);
+                    let _ = events.send(SinkEvent::Transport(Transport::Paused));
+                }
+                SinkCmd::Resume => {
+                    shared.paused.store(false, Ordering::Release);
+                    let _ = events.send(SinkEvent::Transport(Transport::Playing));
+                }
+                SinkCmd::Stop => {
+                    shared.paused.store(true, Ordering::Release);
+                    let _ = feed_tx.send(FeedCmd::Stop);
+                    shared.ring.reset();
+                    shared.mode.store(MODE_NONE, Ordering::Release);
+                    let _ = events.send(SinkEvent::Transport(Transport::Stopped));
+                }
+                SinkCmd::SeekBytes(b) => {
+                    shared.ring.reset();
+                    let _ = feed_tx.send(FeedCmd::Seek(b));
+                }
+                SinkCmd::SetVolume(v) => {
+                    *shared.volume.lock().unwrap() = v.clamp(0.0, 1.0);
+                }
+                SinkCmd::Quit => {
+                    let _ = feed_tx.send(FeedCmd::Quit);
+                    ml_for_cmd.quit();
+                }
             }
         }
     });
@@ -328,26 +378,19 @@ fn sink_loop(
     Ok(())
 }
 
-fn feeder_loop(
-    rx: mpsc::Receiver<FeedCmd>,
-    ring: Ring,
-    layout: Arc<Mutex<Option<Layout>>>,
-    events: crossbeam_channel::Sender<SinkEvent>,
-) {
-    let mut decoder: Option<Box<dyn Decoder>> = None;
-    let mut src_lsb = true;
-    let mut channels = 2usize;
-    let mut base_per_chan = 0u64;
-    let mut pending: Vec<Vec<u8>> = Vec::new();
-    let mut decoder_eof = false;
+fn feeder_loop(rx: mpsc::Receiver<FeedCmd>, shared: Shared, events: crossbeam_channel::Sender<SinkEvent>) {
+    // Active source state.
+    enum Active {
+        Dsd { decoder: Box<dyn Decoder>, src_lsb: bool, channels: usize, spa_rate: u32, base_bytes: u64, pending: Vec<Vec<u8>>, eof: bool },
+        Pcm { source: Box<PcmSource>, base_secs: f64, carry: Vec<u8>, eof: bool },
+    }
+    let mut active: Option<Active> = None;
     let mut ended_sent = false;
     let mut last_pos = Instant::now();
 
     loop {
-        // Drain control commands.
         loop {
-            let cmd = if decoder.is_none() {
-                // Nothing to do: block until a command arrives.
+            let cmd = if active.is_none() {
                 match rx.recv() {
                     Ok(c) => Some(c),
                     Err(_) => return,
@@ -356,99 +399,162 @@ fn feeder_loop(
                 rx.try_recv().ok()
             };
             match cmd {
-                Some(FeedCmd::Load { decoder: d, src_lsb: s, channels: c, base_per_chan: b }) => {
-                    decoder = Some(d);
-                    src_lsb = s;
-                    channels = c.max(1);
-                    base_per_chan = b;
-                    pending = vec![Vec::new(); channels];
-                    decoder_eof = false;
+                Some(FeedCmd::LoadDsd { decoder, src_lsb, channels, spa_rate, base_bytes }) => {
+                    active = Some(Active::Dsd {
+                        decoder, src_lsb, channels: channels.max(1), spa_rate,
+                        base_bytes, pending: vec![Vec::new(); channels.max(1)], eof: false,
+                    });
+                    ended_sent = false;
+                }
+                Some(FeedCmd::LoadPcm { source, base_secs }) => {
+                    active = Some(Active::Pcm { source, base_secs, carry: Vec::new(), eof: false });
                     ended_sent = false;
                 }
                 Some(FeedCmd::Seek(b)) => {
-                    if let Some(d) = decoder.as_mut() {
-                        let landed = d.seek_bytes(b).unwrap_or(b);
-                        base_per_chan = landed;
-                        pending = vec![Vec::new(); channels];
-                        decoder_eof = false;
+                    if let Some(Active::Dsd { decoder, channels, base_bytes, pending, eof, .. }) = active.as_mut() {
+                        let landed = decoder.seek_bytes(b).unwrap_or(b);
+                        *base_bytes = landed;
+                        *pending = vec![Vec::new(); *channels];
+                        *eof = false;
                         ended_sent = false;
                     }
                 }
-                Some(FeedCmd::Stop) => {
-                    decoder = None;
-                    pending.clear();
-                    decoder_eof = false;
-                }
+                Some(FeedCmd::Stop) => active = None,
                 Some(FeedCmd::Quit) => return,
                 None => break,
             }
         }
 
-        let Some(dec) = decoder.as_mut() else { continue };
-        let Some(layout) = *layout.lock().unwrap() else {
-            thread::sleep(Duration::from_millis(3));
-            continue;
+        let Some(act) = active.as_mut() else { continue };
+        let elapsed_secs = match act {
+            Active::Dsd { decoder, src_lsb, channels, spa_rate, base_bytes, pending, eof } => {
+                feed_dsd(&shared, decoder, *src_lsb, *channels, pending, eof);
+                if *spa_rate > 0 {
+                    *base_bytes as f64 / *spa_rate as f64
+                        + (shared.ring.consumed() / *channels as u64) as f64 / *spa_rate as f64
+                } else {
+                    0.0
+                }
+            }
+            Active::Pcm { source, base_secs, carry, eof } => {
+                feed_pcm(&shared, source, carry, eof);
+                let stride = shared.stride.load(Ordering::Relaxed).max(1) as u64;
+                let ch = shared.channels.load(Ordering::Relaxed).max(1) as u64;
+                let rate = source.info.rate.max(1) as f64;
+                let frames = shared.ring.consumed() / stride.max(ch * 4);
+                *base_secs + frames as f64 / rate
+            }
         };
-        let grp = layout.interleave.unsigned_abs().max(1) as usize;
 
-        // Top up the pending planar buffer from the decoder.
-        if !decoder_eof && pending.first().map(|p| p.len()).unwrap_or(0) < READ_CHUNK {
-            let mut planes = Vec::new();
-            match dec.read_planar(READ_CHUNK, &mut planes) {
-                Ok(0) => decoder_eof = true,
-                Ok(_n) => {
-                    if pending.len() != planes.len() {
-                        pending = vec![Vec::new(); planes.len()];
-                    }
-                    for (p, incoming) in pending.iter_mut().zip(planes) {
-                        p.extend_from_slice(&incoming);
-                    }
-                }
-                Err(e) => {
-                    let _ = events.send(SinkEvent::Error(format!("read error: {e}")));
-                    decoder_eof = true;
-                }
-            }
-        }
-
-        // Push group-aligned chunks while there is room in the ring.
-        let avail = pending.first().map(|p| p.len()).unwrap_or(0);
-        let free_per_chan = ring.free_space() / channels;
-        let aligned = (avail.min(free_per_chan) / grp) * grp;
-        if aligned > 0 {
-            let slice: Vec<Vec<u8>> = pending.iter().map(|p| p[..aligned].to_vec()).collect();
-            let packed = repack_planar(&slice, layout, src_lsb);
-            ring.push(&packed);
-            for p in pending.iter_mut() {
-                p.drain(..aligned);
-            }
-        } else if decoder_eof && avail > 0 && ring.free_space() >= channels * grp {
-            // Flush the final partial group, padded to keep stride alignment.
-            let mut slice: Vec<Vec<u8>> = pending.iter().map(|p| p.clone()).collect();
-            for p in slice.iter_mut() {
-                while p.len() < grp {
-                    p.push(DSD_IDLE);
-                }
-            }
-            let packed = repack_planar(&slice, layout, src_lsb);
-            ring.push(&packed);
-            pending.iter_mut().for_each(|p| p.clear());
-        } else if decoder_eof && avail == 0 {
-            ring.set_eof(true);
-        }
-
-        // Throttled position + end-of-track.
         if last_pos.elapsed() >= Duration::from_millis(50) {
-            let per_chan_played = base_per_chan + ring.consumed() / channels as u64;
-            let _ = events.send(SinkEvent::PositionBytes(per_chan_played));
+            let _ = events.send(SinkEvent::PositionSecs(elapsed_secs));
             last_pos = Instant::now();
         }
-        if ring.is_drained() && !ended_sent {
+        if shared.ring.is_drained() && !ended_sent {
             ended_sent = true;
             let _ = events.send(SinkEvent::TrackEnded);
-            decoder = None;
+            active = None;
         }
-
         thread::sleep(Duration::from_millis(2));
+    }
+}
+
+// (DSD/PCM feed helpers below.)
+
+/// Feed the DSD path: decode planar bytes, repack to the negotiated layout in
+/// group-aligned chunks, push to the ring.
+fn feed_dsd(
+    shared: &Shared,
+    decoder: &mut Box<dyn Decoder>,
+    src_lsb: bool,
+    channels: usize,
+    pending: &mut Vec<Vec<u8>>,
+    eof: &mut bool,
+) {
+    let Some(layout) = *shared.layout.lock().unwrap() else {
+        thread::sleep(Duration::from_millis(3));
+        return;
+    };
+    let grp = layout.interleave.unsigned_abs().max(1) as usize;
+
+    if !*eof && pending.first().map(|p| p.len()).unwrap_or(0) < READ_CHUNK {
+        let mut planes = Vec::new();
+        match decoder.read_planar(READ_CHUNK, &mut planes) {
+            Ok(0) => *eof = true,
+            Ok(_) => {
+                if pending.len() != planes.len() {
+                    *pending = vec![Vec::new(); planes.len()];
+                }
+                for (p, incoming) in pending.iter_mut().zip(planes) {
+                    p.extend_from_slice(&incoming);
+                }
+            }
+            Err(_) => *eof = true,
+        }
+    }
+
+    let avail = pending.first().map(|p| p.len()).unwrap_or(0);
+    let free_per_chan = shared.ring.free_space() / channels.max(1);
+    let aligned = (avail.min(free_per_chan) / grp) * grp;
+    if aligned > 0 {
+        let slice: Vec<Vec<u8>> = pending.iter().map(|p| p[..aligned].to_vec()).collect();
+        shared.ring.push(&repack_planar(&slice, layout, src_lsb));
+        for p in pending.iter_mut() {
+            p.drain(..aligned);
+        }
+    } else if *eof && avail > 0 && shared.ring.free_space() >= channels * grp {
+        let mut slice: Vec<Vec<u8>> = pending.iter().map(|p| p.clone()).collect();
+        for p in slice.iter_mut() {
+            while p.len() < grp {
+                p.push(DSD_IDLE);
+            }
+        }
+        shared.ring.push(&repack_planar(&slice, layout, src_lsb));
+        pending.iter_mut().for_each(|p| p.clear());
+    } else if *eof && avail == 0 {
+        shared.ring.set_eof(true);
+    }
+}
+
+/// Feed the PCM path: read f32le from ffmpeg, apply volume, push frame-aligned
+/// bytes to the ring.
+fn feed_pcm(shared: &Shared, source: &mut Box<PcmSource>, carry: &mut Vec<u8>, eof: &mut bool) {
+    let stride = source.info.stride().max(1);
+    if *eof {
+        if carry.is_empty() {
+            shared.ring.set_eof(true);
+        }
+        return;
+    }
+    let free = shared.ring.free_space();
+    if free < stride {
+        thread::sleep(Duration::from_millis(3));
+        return;
+    }
+    let want = free.min(READ_CHUNK);
+    let mut buf = vec![0u8; want];
+    match source.read(&mut buf) {
+        Ok(0) => {
+            *eof = true;
+            if !carry.is_empty() {
+                let gain = *shared.volume.lock().unwrap();
+                apply_gain_f32le(carry, gain);
+                let n = carry.len() / stride * stride;
+                shared.ring.push(&carry[..n]);
+                carry.clear();
+            }
+        }
+        Ok(n) => {
+            carry.extend_from_slice(&buf[..n]);
+            let aligned = carry.len() / stride * stride;
+            if aligned > 0 {
+                let mut out = carry[..aligned].to_vec();
+                let gain = *shared.volume.lock().unwrap();
+                apply_gain_f32le(&mut out, gain);
+                shared.ring.push(&out);
+                carry.drain(..aligned);
+            }
+        }
+        Err(_) => *eof = true,
     }
 }

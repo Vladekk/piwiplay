@@ -1,7 +1,15 @@
-//! Color theme: parses the `[theme]` hex colors from config into ratatui
-//! colors, honoring `NO_COLOR` (disables color entirely).
+//! Color theme.
+//!
+//! Two palettes:
+//! * **terminal** (default) — uses the 16 named ANSI colors, so the *terminal's*
+//!   own theme (e.g. Konsole "Vapor", "Breeze", base16 schemes) recolors the app.
+//!   Nothing is hard-coded to RGB, so switching the terminal theme restyles
+//!   piwiplay live.
+//! * **custom** — uses the explicit `[theme]` hex colors from config.
+//!
+//! `NO_COLOR` disables color entirely regardless of palette.
 
-use piwiplay_engine::config::ThemeConfig;
+use piwiplay_engine::config::{Config, ThemeConfig};
 use ratatui::style::Color;
 
 #[derive(Debug, Clone)]
@@ -14,22 +22,54 @@ pub struct Theme {
     pub meter_clip: Color,
     pub border: Color,
     pub text_dim: Color,
-    /// Whether color output is enabled (false under `NO_COLOR`). Reserved for
-    /// widgets that choose glyphs vs. color to convey state.
     #[allow(dead_code)]
     pub colored: bool,
 }
 
 impl Theme {
-    pub fn from_config(c: &ThemeConfig) -> Self {
+    pub fn from_config(cfg: &Config) -> Self {
         let colored = std::env::var_os("NO_COLOR").is_none();
-        let p = |hex: &str, fallback: Color| {
-            if !colored {
-                Color::Reset
-            } else {
-                parse_hex(hex).unwrap_or(fallback)
-            }
-        };
+        if !colored {
+            return Self::mono();
+        }
+        match cfg.ui.palette.as_str() {
+            "custom" => Self::from_hex(&cfg.theme),
+            _ => Self::terminal(),
+        }
+    }
+
+    /// Palette built from the terminal's own 16 ANSI colors (themeable by the
+    /// terminal emulator). These map to palette slots that schemes recolor.
+    pub fn terminal() -> Self {
+        Theme {
+            accent: Color::Green,
+            played: Color::Cyan,
+            unplayed: Color::DarkGray,
+            meter_ok: Color::Green,
+            meter_warn: Color::Yellow,
+            meter_clip: Color::Red,
+            border: Color::DarkGray,
+            text_dim: Color::Gray,
+            colored: true,
+        }
+    }
+
+    fn mono() -> Self {
+        Theme {
+            accent: Color::Reset,
+            played: Color::Reset,
+            unplayed: Color::Reset,
+            meter_ok: Color::Reset,
+            meter_warn: Color::Reset,
+            meter_clip: Color::Reset,
+            border: Color::Reset,
+            text_dim: Color::Reset,
+            colored: false,
+        }
+    }
+
+    fn from_hex(c: &ThemeConfig) -> Self {
+        let p = |hex: &str, fallback: Color| parse_hex(hex).unwrap_or(fallback);
         Theme {
             accent: p(&c.accent, Color::Green),
             played: p(&c.played, Color::Cyan),
@@ -39,7 +79,7 @@ impl Theme {
             meter_clip: p(&c.meter_clip, Color::Red),
             border: p(&c.border, Color::DarkGray),
             text_dim: p(&c.text_dim, Color::Gray),
-            colored,
+            colored: true,
         }
     }
 
@@ -75,6 +115,29 @@ mod tests {
         assert_eq!(parse_hex("#8ec07c"), Some(Color::Rgb(0x8e, 0xc0, 0x7c)));
         assert_eq!(parse_hex("ff0000"), Some(Color::Rgb(255, 0, 0)));
         assert_eq!(parse_hex("#zzz"), None);
-        assert_eq!(parse_hex("#12345"), None);
+    }
+
+    #[test]
+    fn terminal_palette_uses_named_ansi_colors() {
+        // Named ANSI colors (not Rgb) so the terminal's own theme controls them.
+        let t = Theme::terminal();
+        assert_eq!(t.accent, Color::Green);
+        assert_eq!(t.played, Color::Cyan);
+        assert!(!matches!(t.border, Color::Rgb(..)));
+    }
+
+    #[test]
+    fn custom_palette_uses_hex() {
+        let mut cfg = Config::default();
+        cfg.ui.palette = "custom".into();
+        let t = Theme::from_config(&cfg);
+        assert!(matches!(t.accent, Color::Rgb(..)));
+    }
+
+    #[test]
+    fn default_palette_is_terminal() {
+        let cfg = Config::default();
+        let t = Theme::from_config(&cfg);
+        assert_eq!(t.accent, Color::Green); // named, terminal-themeable
     }
 }

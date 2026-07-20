@@ -4,7 +4,12 @@
 //! average of the 1-bit stream tracks the analog signal. We use each byte's
 //! popcount as a cheap 8×-decimated sample — `value = (ones*2 - 8) / 8` in
 //! `-1.0..=1.0` — which is bit-order independent, then bucket those samples into
-//! per-column peak/RMS. Columns are normalized so the loudest peak maps to 1.0.
+//! per-column peak/RMS.
+//!
+//! Columns hold **absolute** amplitude (not per-track peak-normalized): a
+//! half-scale signal renders at half height and transients spike above the body,
+//! which keeps the display varied instead of a solid block. The renderer applies
+//! any cosmetic shaping.
 
 use std::path::Path;
 
@@ -54,19 +59,7 @@ pub fn envelope(planar: &[Vec<u8>], buckets: usize) -> Vec<WaveColumn> {
             cols[b].rms = (sumsq[b] / counts[b] as f64).sqrt() as f32;
         }
     }
-    normalize(&mut cols);
     cols
-}
-
-fn normalize(cols: &mut [WaveColumn]) {
-    let max_peak = cols.iter().map(|c| c.peak).fold(0f32, f32::max);
-    if max_peak > f32::EPSILON {
-        let g = 1.0 / max_peak;
-        for c in cols.iter_mut() {
-            c.peak = (c.peak * g).min(1.0);
-            c.rms = (c.rms * g).min(1.0);
-        }
-    }
 }
 
 /// Stream a file from disk and compute its envelope. Intended to run on a
@@ -109,13 +102,12 @@ pub fn compute(path: &Path, buckets: usize) -> Result<Vec<WaveColumn>> {
         base += n as u64;
     }
 
-    let mut cols: Vec<WaveColumn> = (0..buckets)
+    let cols: Vec<WaveColumn> = (0..buckets)
         .map(|b| WaveColumn {
             peak: sum_peak[b],
             rms: if counts[b] > 0 { (sumsq[b] / counts[b] as f64).sqrt() as f32 } else { 0.0 },
         })
         .collect();
-    normalize(&mut cols);
     Ok(cols)
 }
 
@@ -143,13 +135,24 @@ mod tests {
     }
 
     #[test]
-    fn loud_section_normalizes_to_one() {
-        // second half is full-scale (0xFF), first half silent-ish (0x0F balanced)
-        let mut bytes = vec![0x0Fu8; 512];
-        bytes.extend(std::iter::repeat(0xFF).take(512));
+    fn absolute_amplitude_not_renormalized() {
+        // Half-scale-ish first half vs full-scale second half. Absolute amplitude
+        // means the quiet part stays low and is NOT stretched to fill height.
+        let mut bytes = vec![0x0Fu8; 512]; // balanced -> ~0.0
+        bytes.extend(std::iter::repeat(0xFF).take(512)); // all ones -> 1.0
         let cols = envelope(&vec![bytes], 2);
-        assert!(cols[0].peak < 0.01, "quiet bucket ~0");
-        assert!((cols[1].peak - 1.0).abs() < 1e-6, "loud bucket ~1");
+        assert!(cols[0].peak < 0.01, "quiet bucket stays ~0 (not normalized up)");
+        assert!((cols[1].peak - 1.0).abs() < 1e-6, "full-scale bucket ~1");
+    }
+
+    #[test]
+    fn half_scale_stays_half_height() {
+        // A steady half-density pattern must render around half, not full.
+        // 0b11001100 has 4 ones -> byte_sample 0.0; use 0b11101110 (6 ones -> 0.5).
+        let cols = envelope(&vec![vec![0b1110_1110u8; 256]], 4);
+        for c in &cols {
+            assert!((c.peak - 0.5).abs() < 1e-6, "steady 0.5 amplitude, got {}", c.peak);
+        }
     }
 
     #[test]

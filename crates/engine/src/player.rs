@@ -2,8 +2,11 @@
 //!
 //! [`Engine`] is the single seam every frontend uses: send [`Command`]s, receive
 //! [`Event`]s. It owns the playlist, transport/volume state, the PipeWire
-//! [`Sink`], and the waveform worker, and runs its own thread so the UI never
-//! blocks. A WebUI would drive the exact same Command/Event API over a socket.
+//! [`Sink`], and the waveform worker, and runs its own thread.
+//!
+//! v2 routes each track to one of two paths: **native DSD** (bit-perfect, volume
+//! fixed) or **PCM via ffmpeg** (any format, or DSD transcoded on request — with
+//! working software volume). The chosen [`OutputMode`] is reported to the UI.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,23 +16,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
 use crate::audio::pipewire_sink::{Sink, SinkCmd, SinkEvent};
-use crate::decode;
+use crate::pcm::{self, PcmSource};
 use crate::playlist::Playlist;
 use crate::types::{DsdInfo, OutputMode, RepeatMode, Tags, TrackInfo, Transport};
-use crate::waveform::{self};
+use crate::waveform;
 use crate::WaveColumn;
 
-/// Number of waveform columns computed per track; the UI subsamples to width.
 const WAVE_BUCKETS: usize = 1600;
-/// Volume step for VolumeStep(+/-).
 const VOL_STEP: f64 = 0.05;
 
 /// Commands accepted by the engine.
 #[derive(Debug, Clone)]
 pub enum Command {
-    /// Clear the queue, enqueue this path (file or dir), and play it.
     OpenAndPlay(PathBuf),
-    /// Add files/dirs to the queue without changing playback.
     Enqueue(Vec<PathBuf>),
     Play,
     Pause,
@@ -37,16 +36,16 @@ pub enum Command {
     Stop,
     Next,
     Prev,
-    /// Seek by ±seconds.
     SeekRelative(i64),
-    /// Seek to a fraction 0.0..=1.0 of the track.
     SeekFraction(f64),
     SetVolume(f64),
     VolumeStep(f64),
     ToggleMute,
     CycleRepeat,
     ToggleShuffle,
-    /// Select a playlist row and play it.
+    /// Toggle the current track between native DSD and ffmpeg/PCM (so volume
+    /// applies). No-op for non-DSD tracks (already PCM).
+    ToggleTranscode,
     SelectAndPlay(usize),
     RemoveTrack(usize),
     ClearPlaylist,
@@ -60,14 +59,15 @@ pub enum Command {
 pub enum Event {
     Status { transport: Transport, track: Option<TrackInfo>, mode: OutputMode },
     Position { elapsed: Duration, total: Duration },
-    Volume { level: f64, muted: bool, hardware: bool },
+    /// `effective` is true when volume actually changes loudness (PCM path);
+    /// false on the bit-perfect DSD path (use the DAC).
+    Volume { level: f64, muted: bool, effective: bool },
     Playlist { tracks: Vec<TrackInfo>, current: Option<usize> },
     Waveform(Arc<Vec<WaveColumn>>),
     Modes { repeat: RepeatMode, shuffle: bool },
     Message(String),
 }
 
-/// The engine handle held by a frontend.
 pub struct Engine {
     cmd_tx: Sender<Command>,
     event_rx: Receiver<Event>,
@@ -103,7 +103,6 @@ impl Drop for Engine {
     }
 }
 
-/// A finished waveform computation, tagged with the path it was for.
 struct WaveResult {
     path: PathBuf,
     columns: Vec<WaveColumn>,
@@ -121,11 +120,13 @@ struct PlayerState {
     mode: OutputMode,
     volume: f64,
     muted: bool,
-    hardware_volume: bool,
+    force_transcode: bool,
 
-    current_info: Option<DsdInfo>,
     current_path: Option<PathBuf>,
-    pos_bytes: u64,
+    current_dsd: Option<DsdInfo>, // Some if the file is DSD
+    playing_pcm: bool,            // true if the active path is PCM
+    total: Duration,
+    elapsed: Duration,
 }
 
 impl PlayerState {
@@ -144,15 +145,17 @@ impl PlayerState {
             mode: OutputMode::Unknown,
             volume: 0.7,
             muted: false,
-            hardware_volume: false, // v1: DSD is bit-perfect; volume is fixed (use DAC)
-            current_info: None,
+            force_transcode: false,
             current_path: None,
-            pos_bytes: 0,
+            current_dsd: None,
+            playing_pcm: false,
+            total: Duration::ZERO,
+            elapsed: Duration::ZERO,
         }
     }
 
     fn run(mut self, cmd_rx: Receiver<Command>) {
-        self.emit_volume();
+        self.push_volume();
         self.emit_modes();
         loop {
             crossbeam_channel::select! {
@@ -164,30 +167,24 @@ impl PlayerState {
                 recv(self.wave_rx) -> msg => if let Ok(w) = msg { self.handle_wave(w); },
             }
         }
-        // Engine dropping Sink stops sink/feeder threads.
     }
-
-    // ---- command handling ----
 
     fn handle_command(&mut self, cmd: Command) {
         match cmd {
             Command::OpenAndPlay(path) => {
                 self.playlist.clear();
                 self.enqueue_paths(&[path]);
-                if let Some(i) = self.playlist.next_index(false).or(Some(0)) {
-                    self.play_index(i);
+                if self.playlist.get(0).is_some() {
+                    self.play_track(0, 0.0);
                 }
                 self.emit_playlist();
             }
             Command::Enqueue(paths) => {
+                let was_empty = self.playlist.is_empty();
                 self.enqueue_paths(&paths);
                 self.emit_playlist();
-                if self.transport == Transport::Stopped {
-                    if let Some(i) = self.playlist.current().or(Some(0)) {
-                        if self.playlist.get(i).is_some() {
-                            self.play_index(i);
-                        }
-                    }
+                if was_empty && self.transport == Transport::Stopped && self.playlist.get(0).is_some() {
+                    self.play_track(0, 0.0);
                 }
             }
             Command::Play => self.resume(),
@@ -196,30 +193,34 @@ impl PlayerState {
                 Transport::Playing => self.pause(),
                 Transport::Paused => self.resume(),
                 Transport::Stopped => {
-                    if let Some(i) = self.playlist.current().or(Some(0)) {
-                        if self.playlist.get(i).is_some() {
-                            self.play_index(i);
-                        }
+                    if self.playlist.get(self.playlist.current().unwrap_or(0)).is_some() {
+                        self.play_track(self.playlist.current().unwrap_or(0), 0.0);
                     }
                 }
             },
             Command::Stop => self.stop(),
             Command::Next => self.skip(false),
             Command::Prev => self.prev(),
-            Command::SeekRelative(secs) => self.seek_relative(secs),
-            Command::SeekFraction(f) => self.seek_fraction(f),
+            Command::SeekRelative(secs) => {
+                let target = (self.elapsed.as_secs_f64() + secs as f64).max(0.0);
+                self.seek_secs(target);
+            }
+            Command::SeekFraction(f) => {
+                let target = f.clamp(0.0, 1.0) * self.total.as_secs_f64();
+                self.seek_secs(target);
+            }
             Command::SetVolume(v) => {
                 self.volume = v.clamp(0.0, 1.0);
-                self.emit_volume();
+                self.push_volume();
             }
             Command::VolumeStep(d) => {
                 let step = if d == 0.0 { 0.0 } else { d.signum() * VOL_STEP };
                 self.volume = (self.volume + step).clamp(0.0, 1.0);
-                self.emit_volume();
+                self.push_volume();
             }
             Command::ToggleMute => {
                 self.muted = !self.muted;
-                self.emit_volume();
+                self.push_volume();
             }
             Command::CycleRepeat => {
                 self.playlist.cycle_repeat();
@@ -229,7 +230,8 @@ impl PlayerState {
                 self.playlist.toggle_shuffle(seed());
                 self.emit_modes();
             }
-            Command::SelectAndPlay(i) => self.play_index(i),
+            Command::ToggleTranscode => self.toggle_transcode(),
+            Command::SelectAndPlay(i) => self.play_track(i, 0.0),
             Command::RemoveTrack(i) => {
                 self.playlist.remove(i);
                 self.emit_playlist();
@@ -261,7 +263,7 @@ impl PlayerState {
         for p in paths {
             if p.is_dir() {
                 collect_dir(p, &mut files);
-            } else if decode::is_supported(p) {
+            } else if crate::decode::is_supported(p) || pcm::is_supported_ext(p) {
                 files.push(p.clone());
             }
         }
@@ -271,30 +273,93 @@ impl PlayerState {
         }
     }
 
-    fn play_index(&mut self, i: usize) {
+    /// Play playlist entry `i`, starting at `start_secs`.
+    fn play_track(&mut self, i: usize, start_secs: f64) {
         let Some(track) = self.playlist.set_current(i).cloned() else { return };
-        match decode::open(&track.path) {
+        self.current_path = Some(track.path.clone());
+        self.mode = OutputMode::Unknown;
+        self.transport = Transport::Playing;
+        self.elapsed = Duration::from_secs_f64(start_secs);
+
+        match crate::decode::open(&track.path) {
             Ok(dec) => {
                 let info = dec.info().clone();
-                self.current_info = Some(info.clone());
-                self.current_path = Some(track.path.clone());
-                self.pos_bytes = 0;
-                self.mode = OutputMode::Unknown;
-                self.transport = Transport::Playing;
-                self.sink.send(SinkCmd::Play { decoder: dec, info });
-                self.spawn_waveform(track.path.clone());
-                self.emit_status();
-                self.emit_position();
-                self.emit_playlist();
-            }
-            Err(e) => {
-                if let Some(t) = self.playlist.get_mut(i) {
-                    t.missing = true;
+                self.current_dsd = Some(info.clone());
+                self.total = info.duration();
+                if self.force_transcode {
+                    drop(dec);
+                    if !self.start_pcm(&track.path, start_secs, Some(info)) {
+                        self.skip(false);
+                        return;
+                    }
+                } else {
+                    self.playing_pcm = false;
+                    self.mode = OutputMode::Native;
+                    self.sink.send(SinkCmd::PlayDsd { decoder: dec, info: info.clone() });
+                    if start_secs > 0.0 {
+                        let bytes = (start_secs * info.spa_rate() as f64) as u64;
+                        self.sink.send(SinkCmd::SeekBytes(bytes));
+                    }
                 }
-                self.msg(format!("cannot play {}: {e}", track.path.display()));
-                self.skip(false);
+                self.spawn_waveform(track.path.clone());
+            }
+            Err(_) => {
+                self.current_dsd = None;
+                if !self.start_pcm(&track.path, start_secs, None) {
+                    if let Some(t) = self.playlist.get_mut(i) {
+                        t.missing = true;
+                    }
+                    self.msg(format!("cannot play {}", track.path.display()));
+                    self.skip(false);
+                    return;
+                }
             }
         }
+        self.push_volume();
+        self.emit_status();
+        self.emit_position();
+        self.emit_playlist();
+    }
+
+    /// Start the PCM (ffmpeg) path. `dsd` carries the DSD info when transcoding a
+    /// DSD file (for a fallback duration). Returns false if it can't start.
+    fn start_pcm(&mut self, path: &Path, start_secs: f64, dsd: Option<DsdInfo>) -> bool {
+        if !pcm::available() {
+            self.msg("ffmpeg not found — install it for non-DSD / transcoded playback".into());
+            return false;
+        }
+        let Some(probe) = pcm::probe(path) else {
+            return false;
+        };
+        let info = probe.target_pcm();
+        let src = match PcmSource::open(path, info, Duration::from_secs_f64(start_secs)) {
+            Ok(s) => s,
+            Err(e) => {
+                self.msg(format!("ffmpeg failed: {e}"));
+                return false;
+            }
+        };
+        self.total = if probe.duration > Duration::ZERO {
+            probe.duration
+        } else {
+            dsd.map(|d| d.duration()).unwrap_or(Duration::ZERO)
+        };
+        self.playing_pcm = true;
+        self.mode = OutputMode::Transcoded;
+        self.sink.send(SinkCmd::PlayPcm { source: Box::new(src), info, start_secs });
+        true
+    }
+
+    fn toggle_transcode(&mut self) {
+        self.force_transcode = !self.force_transcode;
+        // Only DSD tracks can switch path; non-DSD is always PCM.
+        if self.current_dsd.is_some() && self.transport != Transport::Stopped {
+            let i = self.playlist.current().unwrap_or(0);
+            let at = self.elapsed.as_secs_f64();
+            self.play_track(i, at);
+        }
+        let m = if self.force_transcode { "on (PCM, volume active)" } else { "off (native DSD)" };
+        self.msg(format!("transcode: {m}"));
     }
 
     fn resume(&mut self) {
@@ -316,71 +381,64 @@ impl PlayerState {
     fn stop(&mut self) {
         self.sink.send(SinkCmd::Stop);
         self.transport = Transport::Stopped;
-        self.pos_bytes = 0;
+        self.playing_pcm = false;
+        self.elapsed = Duration::ZERO;
         self.emit_status();
         self.emit_position();
     }
 
     fn skip(&mut self, natural: bool) {
         match self.playlist.next_index(natural) {
-            Some(i) => self.play_index(i),
+            Some(i) => self.play_track(i, 0.0),
             None => self.stop(),
         }
     }
 
     fn prev(&mut self) {
-        // Restart current track if we're past the first few seconds.
-        if self.elapsed().as_secs() > 3 {
-            self.seek_fraction(0.0);
+        if self.elapsed.as_secs() > 3 {
+            self.seek_secs(0.0);
             return;
         }
         match self.playlist.prev_index() {
-            Some(i) => self.play_index(i),
-            None => self.seek_fraction(0.0),
+            Some(i) => self.play_track(i, 0.0),
+            None => self.seek_secs(0.0),
         }
     }
 
-    fn seek_relative(&mut self, secs: i64) {
-        let Some(info) = &self.current_info else { return };
-        let rate = info.spa_rate() as i64;
-        let cur = self.pos_bytes as i64;
-        let target = (cur + secs * rate).clamp(0, info.total_bytes() as i64) as u64;
-        self.pos_bytes = target;
-        self.sink.send(SinkCmd::SeekBytes(target));
+    fn seek_secs(&mut self, target: f64) {
+        let target = target.clamp(0.0, self.total.as_secs_f64().max(0.0));
+        self.elapsed = Duration::from_secs_f64(target);
+        if self.playing_pcm {
+            // Re-open the ffmpeg source at the new offset.
+            if let Some(path) = self.current_path.clone() {
+                let dsd = self.current_dsd.clone();
+                self.start_pcm(&path, target, dsd);
+            }
+        } else if let Some(info) = &self.current_dsd {
+            let bytes = (target * info.spa_rate() as f64) as u64;
+            self.sink.send(SinkCmd::SeekBytes(bytes));
+        }
         self.emit_position();
     }
-
-    fn seek_fraction(&mut self, f: f64) {
-        let Some(info) = &self.current_info else { return };
-        let target = (f.clamp(0.0, 1.0) * info.total_bytes() as f64) as u64;
-        self.pos_bytes = target;
-        self.sink.send(SinkCmd::SeekBytes(target));
-        self.emit_position();
-    }
-
-    // ---- sink / waveform events ----
 
     fn handle_sink(&mut self, ev: SinkEvent) {
         match ev {
-            SinkEvent::Negotiated { mode, .. } => {
+            SinkEvent::Negotiated { mode } => {
                 self.mode = mode;
                 self.emit_status();
             }
-            SinkEvent::PositionBytes(b) => {
-                self.pos_bytes = b;
+            SinkEvent::PositionSecs(s) => {
+                self.elapsed = Duration::from_secs_f64(s.max(0.0));
                 self.emit_position();
             }
             SinkEvent::TrackEnded => self.skip(true),
             SinkEvent::Transport(t) => {
-                // Sink is authoritative for Playing/Paused transitions it drives.
                 if self.transport != Transport::Stopped || t == Transport::Playing {
                     self.transport = t;
                     self.emit_status();
                 }
             }
-            SinkEvent::Error(msg) => {
-                self.msg(format!("audio: {msg}"));
-            }
+            SinkEvent::Error(msg) => self.msg(format!("audio: {msg}")),
         }
     }
 
@@ -402,13 +460,14 @@ impl PlayerState {
             .ok();
     }
 
-    // ---- emit helpers ----
-
-    fn elapsed(&self) -> Duration {
-        match &self.current_info {
-            Some(i) if i.spa_rate() > 0 => Duration::from_secs_f64(self.pos_bytes as f64 / i.spa_rate() as f64),
-            _ => Duration::ZERO,
-        }
+    fn push_volume(&self) {
+        let gain = if self.muted { 0.0 } else { self.volume as f32 };
+        self.sink.send(SinkCmd::SetVolume(gain));
+        let _ = self.events.send(Event::Volume {
+            level: self.volume,
+            muted: self.muted,
+            effective: self.playing_pcm,
+        });
     }
 
     fn emit_status(&self) {
@@ -420,16 +479,7 @@ impl PlayerState {
     }
 
     fn emit_position(&self) {
-        let total = self.current_info.as_ref().map(|i| i.duration()).unwrap_or(Duration::ZERO);
-        let _ = self.events.send(Event::Position { elapsed: self.elapsed(), total });
-    }
-
-    fn emit_volume(&self) {
-        let _ = self.events.send(Event::Volume {
-            level: self.volume,
-            muted: self.muted,
-            hardware: self.hardware_volume,
-        });
+        let _ = self.events.send(Event::Position { elapsed: self.elapsed, total: self.total });
     }
 
     fn emit_modes(&self) {
@@ -451,25 +501,20 @@ impl PlayerState {
     }
 }
 
-/// Build a [`TrackInfo`] by reading the container header (best effort).
+/// Build a [`TrackInfo`] by reading the container header, falling back to an
+/// ffprobe for non-DSD files (best effort).
 fn track_info(path: &Path) -> TrackInfo {
-    match decode::open(path) {
-        Ok(dec) => TrackInfo {
+    if let Ok(dec) = crate::decode::open(path) {
+        return TrackInfo {
             path: path.to_path_buf(),
             tags: dec.tags().clone(),
             info: Some(dec.info().clone()),
             missing: false,
-        },
-        Err(_) => TrackInfo {
-            path: path.to_path_buf(),
-            tags: Tags::default(),
-            info: None,
-            missing: true,
-        },
+        };
     }
+    TrackInfo { path: path.to_path_buf(), tags: Tags::default(), info: None, missing: false }
 }
 
-/// Recursively collect supported files from a directory.
 fn collect_dir(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
@@ -477,7 +522,7 @@ fn collect_dir(dir: &Path, out: &mut Vec<PathBuf>) {
     for p in entries {
         if p.is_dir() {
             collect_dir(&p, out);
-        } else if decode::is_supported(&p) {
+        } else if crate::decode::is_supported(&p) || pcm::is_supported_ext(&p) {
             out.push(p);
         }
     }
