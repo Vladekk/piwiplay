@@ -1,0 +1,21 @@
+/target
+/spike/target
+**/*.rs.bk
+Cargo.lock.orig
+*.DS_Store
+
+# Environment / bind-mount artifacts (not part of the project)
+.bash_profile
+.bashrc
+.gitconfig
+.profile
+.zprofile
+.zshrc
+.ripgreprc
+.mcp.json
+.idea/
+.vscode/
+.claude/
+.gitmodules
+.idea
+.vscode
