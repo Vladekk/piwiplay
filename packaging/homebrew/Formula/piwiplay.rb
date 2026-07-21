@@ -8,9 +8,9 @@
 class Piwiplay < Formula
   desc "Console (TUI) DSD audio player over PipeWire"
   homepage "https://github.com/vladekk/piwiplay"
-  url "https://github.com/vladekk/piwiplay/archive/refs/tags/v0.2.0.tar.gz"
-  # sha256 of the v0.2.0 source tarball (github archive).
-  sha256 "d98125f02a8430f80fa68a50eba54f9f5bae8531fb6b51fc356158824c78f525"
+  url "https://github.com/vladekk/piwiplay/archive/refs/tags/v0.3.0.tar.gz"
+  # sha256 of the v0.3.0 source tarball (github archive).
+  sha256 "b9dd6f87fd08ff94411f31bb3e98e34791bbc28689bc00d05e3defd236b8169d"
   license "MIT"
   head "https://github.com/vladekk/piwiplay.git", branch: "main"
 
