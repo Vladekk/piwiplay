@@ -3,7 +3,8 @@
 A console (TUI) audio player for Linux that plays **DSD** files natively through
 **PipeWire**, with a colorful, resizable, unicode-rich interface.
 
-- Native DSD (DSD64/128/256/512) via `.dsf` and `.dff`/`.dsdiff`
+- Native DSD (DSD64/128/256/512) via `.dsf` and `.dff`/`.dsdiff`, **including
+  DST-compressed DFF** (losslessly decompressed to native DSD, bit-exact)
 - Bit-perfect passthrough to a DSD-capable PipeWire sink — no resampling
 - **All other formats via ffmpeg** (FLAC, ALAC, WAV, MP3, AAC, Opus, …),
   decoded to PCM — plus a per-track toggle to transcode DSD to PCM so software

@@ -1,24 +1,53 @@
 //! DFF / DSDIFF (Philips) container decoder. DFF uses big-endian IFF-style
-//! chunks. 1-bit samples are **MSB-first**, byte-interleaved across channels
-//! (`[ch0][ch1][ch0][ch1]…` at 1-byte granularity). DST (compressed) is
-//! rejected — v1 plays only raw DSD.
+//! chunks. 1-bit samples are **MSB-first**, byte-interleaved across channels.
+//!
+//! Two payload kinds are supported natively:
+//! * **`DSD ` (uncompressed)** — raw byte-interleaved DSD.
+//! * **`DST ` (compressed)** — DST-compressed frames, decoded back to raw DSD by
+//!   [`piwiplay_dst`], so DST also plays through the native DSD path.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use super::{be_u32, be_u64, Decoder};
+use piwiplay_dst::{samples_per_frame, DstDecoder};
+
+use super::{be_u16, be_u32, be_u64, Decoder};
 use crate::error::{EngineError, Result};
 use crate::types::{BitOrder, DsdInfo, Tags};
+
+/// A DST frame's location within the file.
+#[derive(Clone, Copy)]
+struct FrameLoc {
+    offset: u64,
+    size: usize,
+}
+
+/// State for decoding a DST (compressed) payload on the fly.
+struct DstState {
+    decoder: DstDecoder,
+    frames: Vec<FrameLoc>,
+    /// Bytes per channel per fully-decoded frame.
+    frame_bytes: usize,
+    /// Samples (bits) per channel per frame.
+    frame_samples: usize,
+    /// Next frame to decode.
+    frame_idx: usize,
+    /// Currently-decoded frame's planar bytes and how much has been served.
+    buf: Vec<Vec<u8>>,
+    buf_off: usize,
+}
 
 pub struct DffDecoder {
     file: File,
     info: DsdInfo,
     tags: Tags,
     channels: usize,
+    /// Uncompressed data start (raw mode only).
     data_start: u64,
     total_per_chan: u64,
     pos_per_chan: u64,
+    dst: Option<DstState>,
 }
 
 impl DffDecoder {
@@ -33,8 +62,9 @@ impl DffDecoder {
         let mut channels = 0usize;
         let mut sample_rate = 0u32;
         let mut compressed = false;
-        let mut data_start = 0u64;
+        let mut data_start = 0u64; // uncompressed DSD payload
         let mut data_len = 0u64;
+        let mut dst_body: Option<(u64, u64)> = None; // (start, len) of DST chunk body
 
         // Scan top-level chunks (id[4] + size[BE u64] + body, even-padded).
         let mut pos = 16u64;
@@ -58,39 +88,116 @@ impl DffDecoder {
                     data_len = size;
                 }
                 b"DST " => {
-                    return Err(EngineError::DstUnsupported);
+                    dst_body = Some((body_start, size));
                 }
                 _ => {}
             }
-            // advance, IFF pads odd-sized chunk bodies to an even boundary
             pos = body_start + size + (size & 1);
         }
 
-        if compressed {
-            return Err(EngineError::DstUnsupported);
-        }
-        if channels == 0 || sample_rate == 0 || data_start == 0 {
-            return Err(EngineError::BadFile("missing PROP/DSD chunk".into()));
+        if channels == 0 || sample_rate == 0 {
+            return Err(EngineError::BadFile("missing PROP chunk".into()));
         }
 
+        // ---- DST (compressed) payload ----
+        if compressed || dst_body.is_some() {
+            let (start, len) = dst_body.ok_or_else(|| EngineError::BadFile("DST flagged but no DST chunk".into()))?;
+            let frames = scan_dst_frames(&mut file, start, len).map_err(|e| EngineError::io(path, e))?;
+            if frames.is_empty() {
+                return Err(EngineError::BadFile("no DST frames".into()));
+            }
+            let frame_samples = samples_per_frame(sample_rate);
+            if frame_samples == 0 {
+                return Err(EngineError::BadFile("nonstandard DSD rate for DST".into()));
+            }
+            let frame_bytes = frame_samples / 8;
+            let total_per_chan = frames.len() as u64 * frame_bytes as u64;
+            let samples_per_channel = total_per_chan * 8;
+            return Ok(Self {
+                file,
+                info: DsdInfo { channels: channels as u32, sample_rate, bit_order: BitOrder::Msb, samples_per_channel },
+                tags: Tags::default(),
+                channels,
+                data_start: 0,
+                total_per_chan,
+                pos_per_chan: 0,
+                dst: Some(DstState {
+                    decoder: DstDecoder::new(),
+                    frames,
+                    frame_bytes,
+                    frame_samples,
+                    frame_idx: 0,
+                    buf: Vec::new(),
+                    buf_off: 0,
+                }),
+            });
+        }
+
+        // ---- uncompressed DSD payload ----
+        if data_start == 0 {
+            return Err(EngineError::BadFile("missing DSD/DST data chunk".into()));
+        }
         let total_per_chan = data_len / channels as u64;
         let samples_per_channel = total_per_chan * 8;
         file.seek(SeekFrom::Start(data_start)).map_err(|e| EngineError::io(path, e))?;
 
         Ok(Self {
             file,
-            info: DsdInfo {
-                channels: channels as u32,
-                sample_rate,
-                bit_order: BitOrder::Msb,
-                samples_per_channel,
-            },
-            tags: Tags::default(), // DFF DIIN metadata is rarely present; skipped in v1
+            info: DsdInfo { channels: channels as u32, sample_rate, bit_order: BitOrder::Msb, samples_per_channel },
+            tags: Tags::default(),
             channels,
             data_start,
             total_per_chan,
             pos_per_chan: 0,
+            dst: None,
         })
+    }
+
+    /// Decode the DST frame at `frame_idx` into `buf` (planar).
+    fn decode_dst_frame(&mut self, frame_idx: usize) -> io::Result<()> {
+        let dst = self.dst.as_mut().expect("dst mode");
+        let loc = dst.frames[frame_idx];
+        let mut pkt = vec![0u8; loc.size];
+        self.file.seek(SeekFrom::Start(loc.offset))?;
+        self.file.read_exact(&mut pkt)?;
+        match dst.decoder.decode_frame(&pkt, self.channels, dst.frame_samples) {
+            Ok(planes) => {
+                dst.buf = planes;
+                dst.buf_off = 0;
+                Ok(())
+            }
+            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+        }
+    }
+
+    fn read_planar_dst(&mut self, max_per_chan: usize, out: &mut Vec<Vec<u8>>) -> io::Result<usize> {
+        // Ensure the current decoded frame has bytes available.
+        loop {
+            let (empty, more) = {
+                let dst = self.dst.as_ref().unwrap();
+                (dst.buf.is_empty() || dst.buf_off >= dst.frame_bytes, dst.frame_idx < dst.frames.len())
+            };
+            if !empty {
+                break;
+            }
+            if !more {
+                return Ok(0);
+            }
+            let idx = self.dst.as_ref().unwrap().frame_idx;
+            self.decode_dst_frame(idx)?;
+            self.dst.as_mut().unwrap().frame_idx += 1;
+        }
+
+        let dst = self.dst.as_mut().unwrap();
+        let avail = dst.frame_bytes - dst.buf_off;
+        let n = max_per_chan.min(avail);
+        out.clear();
+        for c in 0..self.channels {
+            out.push(dst.buf[c][dst.buf_off..dst.buf_off + n].to_vec());
+        }
+        dst.buf_off += n;
+        self.pos_per_chan += n as u64;
+        Ok(n)
     }
 }
 
@@ -106,17 +213,36 @@ fn parse_prop(body: &[u8], channels: &mut usize, rate: &mut u32, compressed: &mu
         let end = (start + size).min(body.len());
         match id {
             b"FS  " if end >= start + 4 => *rate = be_u32(body, start),
-            b"CHNL" if end >= start + 2 => {
-                *channels = u16::from_be_bytes([body[start], body[start + 1]]) as usize;
-            }
-            b"CMPR" if end >= start + 4 => {
-                *compressed = &body[start..start + 4] != b"DSD ";
-            }
+            b"CHNL" if end >= start + 2 => *channels = be_u16(body, start) as usize,
+            b"CMPR" if end >= start + 4 => *compressed = &body[start..start + 4] != b"DSD ",
             _ => {}
         }
         i = start + size + (size & 1);
     }
     Ok(())
+}
+
+/// Parse the DST sound-data chunk into its list of DSTF frame locations.
+/// The `DST ` body contains an `FRTE` info chunk then `DSTF` (+ optional `DSTC`).
+fn scan_dst_frames(file: &mut File, start: u64, len: u64) -> io::Result<Vec<FrameLoc>> {
+    let mut frames = Vec::new();
+    let mut pos = start;
+    let end = start + len;
+    while pos + 12 <= end {
+        file.seek(SeekFrom::Start(pos))?;
+        let mut hdr = [0u8; 12];
+        if file.read_exact(&mut hdr).is_err() {
+            break;
+        }
+        let id = [hdr[0], hdr[1], hdr[2], hdr[3]];
+        let size = be_u64(&hdr, 4);
+        let body = pos + 12;
+        if &id == b"DSTF" {
+            frames.push(FrameLoc { offset: body, size: size as usize });
+        }
+        pos = body + size + (size & 1);
+    }
+    Ok(frames)
 }
 
 impl Decoder for DffDecoder {
@@ -128,6 +254,10 @@ impl Decoder for DffDecoder {
     }
 
     fn read_planar(&mut self, max_per_chan: usize, out: &mut Vec<Vec<u8>>) -> io::Result<usize> {
+        if self.dst.is_some() {
+            return self.read_planar_dst(max_per_chan, out);
+        }
+        // uncompressed byte-interleaved
         let remaining = (self.total_per_chan - self.pos_per_chan) as usize;
         let n = max_per_chan.min(remaining);
         if n == 0 {
@@ -156,6 +286,22 @@ impl Decoder for DffDecoder {
 
     fn seek_bytes(&mut self, per_chan_byte: u64) -> io::Result<u64> {
         let target = per_chan_byte.min(self.total_per_chan);
+        if let Some(dst) = self.dst.as_ref() {
+            let fb = dst.frame_bytes.max(1) as u64;
+            let frame = (target / fb) as usize;
+            let within = (target % fb) as usize;
+            self.dst.as_mut().unwrap().frame_idx = frame;
+            self.dst.as_mut().unwrap().buf.clear();
+            self.pos_per_chan = frame as u64 * fb;
+            if frame < self.dst.as_ref().unwrap().frames.len() {
+                self.decode_dst_frame(frame)?;
+                self.dst.as_mut().unwrap().frame_idx = frame + 1;
+                let clamp = within.min(self.dst.as_ref().unwrap().frame_bytes);
+                self.dst.as_mut().unwrap().buf_off = clamp;
+                self.pos_per_chan += clamp as u64;
+            }
+            return Ok(self.pos_per_chan);
+        }
         let file_off = self.data_start + target * self.channels as u64;
         self.file.seek(SeekFrom::Start(file_off))?;
         self.pos_per_chan = target;
@@ -174,7 +320,7 @@ impl Decoder for DffDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testgen::{dff_bytes, dff_dst_bytes, plane_byte};
+    use crate::testgen::{dff_bytes, plane_byte};
     use std::io::Write;
 
     fn write_tmp(bytes: &[u8]) -> tempfile::NamedTempFile {
@@ -221,11 +367,5 @@ mod tests {
         dec.read_planar(2, &mut out).unwrap();
         assert_eq!(out[0][0], plane_byte(0, 20));
         assert_eq!(out[1][0], plane_byte(1, 20));
-    }
-
-    #[test]
-    fn rejects_dst() {
-        let f = write_tmp(&dff_dst_bytes(2, 2_822_400));
-        assert!(matches!(DffDecoder::open(f.path()), Err(EngineError::DstUnsupported)));
     }
 }

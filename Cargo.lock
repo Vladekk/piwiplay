@@ -671,6 +671,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "piwiplay-dst"
+version = "0.2.0"
+
+[[package]]
 name = "piwiplay-engine"
 version = "0.2.0"
 dependencies = [
@@ -678,6 +682,7 @@ dependencies = [
  "crossbeam-channel",
  "directories",
  "pipewire",
+ "piwiplay-dst",
  "serde",
  "tempfile",
  "thiserror 2.0.19",

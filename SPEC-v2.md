@@ -24,8 +24,12 @@ Extends [`SPEC.md`](SPEC.md) (v1: native-DSD-only). v2 makes piwiplay a
 - PCM output path in the sink (F32LE) alongside native DSD; software volume.
 - Per-track routing + the **`t` transcode toggle** (native DSD ⇄ PCM) with
   active volume on the PCM path; live `NATIVE`/`PCM` badge.
-- DST-compressed DFF plays via the ffmpeg PCM fallback (our native decoder
-  rejects DST, the player then routes through ffmpeg).
+- **DST-compressed DFF now plays NATIVELY** (bit-perfect): the `piwiplay-dst`
+  crate (a Rust port of ffmpeg's LGPL `dstdec.c`) losslessly decompresses DST
+  frames to raw DSD, which flows through the native path. Validated **bit-exact**
+  against the FFmpeg FATE conformance sample (decoding both our output and the
+  original DST to PCM yields identical bytes). `piwiplay-dst` is LGPL-2.1,
+  isolated so `engine`/`tui` stay MIT.
 
 **Remaining (still design-only in this spec):**
 - **DoP** packing (`dop_pack`) and a DoP DAC path — the `Dop` badge is defined

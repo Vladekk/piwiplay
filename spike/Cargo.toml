@@ -11,6 +11,10 @@ name = "gen-dsf"
 path = "src/bin/gen_dsf.rs"
 
 [[bin]]
+name = "gen-dff"
+path = "src/bin/gen_dff.rs"
+
+[[bin]]
 name = "play-dsd"
 path = "src/main.rs"
 

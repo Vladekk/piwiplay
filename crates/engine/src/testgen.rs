@@ -102,36 +102,3 @@ pub fn dff_bytes(channels: usize, sample_rate: u32, per_chan: usize) -> Vec<u8> 
     out
 }
 
-/// Build a DST-compressed DFF (should be rejected by the decoder).
-pub fn dff_dst_bytes(channels: usize, sample_rate: u32) -> Vec<u8> {
-    fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
-        let mut v = Vec::new();
-        v.extend_from_slice(id);
-        v.extend_from_slice(&(body.len() as u64).to_be_bytes());
-        v.extend_from_slice(body);
-        if body.len() % 2 == 1 {
-            v.push(0);
-        }
-        v
-    }
-    let mut prop = Vec::new();
-    prop.extend_from_slice(b"SND ");
-    prop.extend_from_slice(&chunk(b"FS  ", &sample_rate.to_be_bytes()));
-    let mut chnl = Vec::new();
-    chnl.extend_from_slice(&(channels as u16).to_be_bytes());
-    prop.extend_from_slice(&chunk(b"CHNL", &chnl));
-    prop.extend_from_slice(&chunk(b"CMPR", b"DST \0\0dst"));
-
-    let prop_chunk = chunk(b"PROP", &prop);
-    let dst_chunk = chunk(b"DST ", &[0u8; 8]);
-    let mut form_body = Vec::new();
-    form_body.extend_from_slice(b"DSD ");
-    form_body.extend_from_slice(&prop_chunk);
-    form_body.extend_from_slice(&dst_chunk);
-
-    let mut out = Vec::new();
-    out.extend_from_slice(b"FRM8");
-    out.extend_from_slice(&(form_body.len() as u64).to_be_bytes());
-    out.extend_from_slice(&form_body);
-    out
-}

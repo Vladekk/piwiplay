@@ -1,0 +1,16 @@
+[package]
+name = "piwiplay-dst"
+description = "DST (Direct Stream Transfer) lossless decoder — decodes compressed DSD frames to raw DSD. Rust port of FFmpeg's libavcodec/dstdec.c."
+version.workspace = true
+edition.workspace = true
+# LGPL-2.1: this crate is a derivative of FFmpeg's LGPL-2.1 dstdec.c. It is kept
+# separate so the MIT-licensed engine/tui crates are not affected; piwiplay
+# links it dynamically-equivalently (built from source in-tree, so relinking is
+# always possible per LGPL §6).
+license = "LGPL-2.1-or-later"
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "piwiplay_dst"

@@ -15,6 +15,8 @@ live in [README.md](README.md).
   PCM path, playlist, waveform. Driven only by the `Command`/`Event` API in
   `player.rs`. **No UI dependencies.**
 - `crates/tui` (`piwiplay`) — ratatui frontend (lib + thin `main.rs`).
+- `crates/dst` (`piwiplay-dst`) — DST→DSD decoder, **LGPL-2.1** (port of ffmpeg's
+  `dstdec.c`), kept isolated so `engine`/`tui` remain MIT.
 - `spike/` — the Milestone-0 DSD proof; see `spike/RESULTS.md`.
 
 ## Build & test

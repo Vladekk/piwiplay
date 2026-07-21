@@ -65,6 +65,9 @@ pub(crate) fn le_u32(b: &[u8], o: usize) -> u32 {
 pub(crate) fn le_u64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }
+pub(crate) fn be_u16(b: &[u8], o: usize) -> u16 {
+    u16::from_be_bytes(b[o..o + 2].try_into().unwrap())
+}
 pub(crate) fn be_u32(b: &[u8], o: usize) -> u32 {
     u32::from_be_bytes(b[o..o + 4].try_into().unwrap())
 }
