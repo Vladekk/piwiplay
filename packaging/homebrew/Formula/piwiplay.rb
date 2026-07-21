@@ -8,9 +8,9 @@
 class Piwiplay < Formula
   desc "Console (TUI) DSD audio player over PipeWire"
   homepage "https://github.com/vladekk/piwiplay"
-  url "https://github.com/vladekk/piwiplay/archive/refs/tags/v0.1.0.tar.gz"
-  # sha256 of the v0.1.0 source tarball (github archive).
-  sha256 "cf739401b8b9b9db135a781243859b0a9a0f353aafac000dafcce553d3dc0c34"
+  url "https://github.com/vladekk/piwiplay/archive/refs/tags/v0.2.0.tar.gz"
+  # sha256 of the v0.2.0 source tarball (github archive).
+  sha256 "d98125f02a8430f80fa68a50eba54f9f5bae8531fb6b51fc356158824c78f525"
   license "MIT"
   head "https://github.com/vladekk/piwiplay.git", branch: "main"
 
@@ -19,6 +19,8 @@ class Piwiplay < Formula
   # PipeWire only exists on Linux; refuse to build on macOS.
   depends_on :linux
   depends_on "pipewire"
+  # ffmpeg decodes non-DSD formats and powers the DSD->PCM transcode toggle.
+  depends_on "ffmpeg"
 
   def install
     system "cargo", "install", *std_cargo_args(path: "crates/tui")
@@ -26,9 +28,10 @@ class Piwiplay < Formula
 
   def caveats
     <<~EOS
-      piwiplay requires a running PipeWire session and a DAC that accepts native
-      DSD. On sinks whose active profile exposes no DSD format, playback will
-      report an error rather than convert (DoP/transcoding arrive in v2).
+      piwiplay requires a running PipeWire session. Native DSD needs a DSD-capable
+      DAC; press `t` to transcode a DSD track to PCM (via ffmpeg) when native is
+      unavailable or you want software volume. Non-DSD formats play via ffmpeg
+      automatically.
     EOS
   end
 
