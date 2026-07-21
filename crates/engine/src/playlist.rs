@@ -164,7 +164,8 @@ impl Playlist {
         }
     }
 
-    /// Write an extended-M3U playlist.
+    /// Write an extended-M3U playlist. Track paths are written **absolute** so
+    /// the playlist plays regardless of where it is loaded from.
     pub fn save_m3u(&self, path: &Path) -> Result<()> {
         let mut f = std::fs::File::create(path).map_err(|e| EngineError::io(path, e))?;
         writeln!(f, "#EXTM3U").map_err(|e| EngineError::io(path, e))?;
@@ -172,7 +173,7 @@ impl Playlist {
             let secs = t.info.as_ref().map(|i| i.duration().as_secs()).unwrap_or(0);
             writeln!(f, "#EXTINF:{},{}", secs, t.display_title())
                 .map_err(|e| EngineError::io(path, e))?;
-            writeln!(f, "{}", t.path.display()).map_err(|e| EngineError::io(path, e))?;
+            writeln!(f, "{}", absolutize(&t.path).display()).map_err(|e| EngineError::io(path, e))?;
         }
         Ok(())
     }
@@ -198,6 +199,16 @@ impl Playlist {
             out.push(p);
         }
         Ok(out)
+    }
+}
+
+/// Make a path absolute (without requiring it to exist): absolute paths are
+/// returned as-is; relative paths are joined onto the current directory.
+pub fn absolutize(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().map(|c| c.join(p)).unwrap_or_else(|_| p.to_path_buf())
     }
 }
 
@@ -294,5 +305,19 @@ mod tests {
         let paths = Playlist::load_m3u_paths(&path).unwrap();
         assert_eq!(paths.len(), 2);
         assert!(paths[0].ends_with("t0.dsf"));
+    }
+
+    #[test]
+    fn save_m3u_writes_absolute_paths() {
+        // A filename-only track must be saved as an absolute path so the
+        // playlist plays when loaded from a different directory.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pl.m3u");
+        let mut p = Playlist::new();
+        p.push(track("song.dsf"));
+        p.save_m3u(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let entry = text.lines().find(|l| !l.starts_with('#') && l.ends_with("song.dsf")).unwrap();
+        assert!(Path::new(entry).is_absolute(), "entry must be absolute, got {entry:?}");
     }
 }

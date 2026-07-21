@@ -269,7 +269,10 @@ impl PlayerState {
         }
         files.sort();
         for f in files {
-            self.playlist.push(track_info(&f));
+            // Store absolute paths so the queue plays and saved playlists are
+            // portable (canonicalize when the file exists, else fall back).
+            let abs = std::fs::canonicalize(&f).unwrap_or_else(|_| crate::playlist::absolutize(&f));
+            self.playlist.push(track_info(&abs));
         }
     }
 
