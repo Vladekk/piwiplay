@@ -17,8 +17,10 @@ cd "$dest"
 if [ ! -d .git ]; then
   git init -q
 fi
+# Derive the version from the formula so the commit message stays accurate.
+ver=$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' Formula/piwiplay.rb | head -1)
 git add -A
-git commit -q -m "piwiplay tap: formula v0.1.0" || echo "nothing to commit"
+git commit -q -m "piwiplay tap: formula ${ver:-update}" || echo "nothing to commit"
 
 cat <<EOF
 
